@@ -2,3 +2,4 @@ build
 stefan.mode1v3
 stefan.pbxuser
 .DS_Store
+infra/iam-cdn-admin-policy.json
