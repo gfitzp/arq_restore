@@ -40,6 +40,13 @@
     uint32_t _winAttrs;
     uint32_t _reparseTag;
     BOOL _reparsePointIsDirectory;
+    int64_t _addedTime_sec;
+    int64_t _addedTime_nsec;
+    uint32_t _documentId;
+    BOOL _hasDocumentId;
+    BOOL _isSparse;
+    uint64_t _sparseLogicalSize;
+    NSArray *_holes;
 }
 @end
 
@@ -321,6 +328,33 @@
                 return nil;
             }
         }
+        if (theTreeVersion >= 4) {
+            if (![IntegerIO readInt64:&_addedTime_sec from:bis error:error]
+                || ![IntegerIO readInt64:&_addedTime_nsec from:bis error:error]
+                || ![IntegerIO readUInt32:&_documentId from:bis error:error]
+                || ![BooleanIO read:&_hasDocumentId from:bis error:error]
+                || ![BooleanIO read:&_isSparse from:bis error:error]
+                || ![IntegerIO readUInt64:&_sparseLogicalSize from:bis error:error]) {
+                return nil;
+            }
+            uint64_t holeCount = 0;
+            if (![IntegerIO readUInt64:&holeCount from:bis error:error]) {
+                return nil;
+            }
+            NSMutableArray *holes = [NSMutableArray array];
+            for (uint64_t i = 0; i < holeCount; i++) {
+                uint64_t holeOffset = 0;
+                uint64_t holeLength = 0;
+                if (![IntegerIO readUInt64:&holeOffset from:bis error:error]
+                    || ![IntegerIO readUInt64:&holeLength from:bis error:error]) {
+                    return nil;
+                }
+                [holes addObject:[NSArray arrayWithObjects:
+                                  [NSNumber numberWithUnsignedLongLong:holeOffset],
+                                  [NSNumber numberWithUnsignedLongLong:holeLength], nil]];
+            }
+            _holes = holes;
+        }
         _userName = userName;
         _groupName = groupName;
         _deleted = deleted;
@@ -364,6 +398,13 @@
 - (uint32_t)winAttrs { return _winAttrs; }
 - (uint32_t)reparseTag { return _reparseTag; }
 - (BOOL)reparsePointIsDirectory { return _reparsePointIsDirectory; }
+- (int64_t)addedTime_sec { return _addedTime_sec; }
+- (int64_t)addedTime_nsec { return _addedTime_nsec; }
+- (uint32_t)documentId { return _documentId; }
+- (BOOL)hasDocumentId { return _hasDocumentId; }
+- (BOOL)isSparse { return _isSparse; }
+- (uint64_t)sparseLogicalSize { return _sparseLogicalSize; }
+- (NSArray *)holes { return _holes ? _holes : [NSArray array]; }
 
 - (NSString *)description {
     return [NSString stringWithFormat:@"<Arq7Node isTree=%@ itemSize=%qu>",

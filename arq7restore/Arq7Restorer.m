@@ -344,10 +344,11 @@
             }
             @autoreleasepool {
                 // Resume support: a file already present with the expected size is considered done.
+                unsigned long long expectedSize = [item.node isSparse] ? [item.node sparseLogicalSize] : [item.node itemSize];
                 NSDictionary *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:item.destPath error:NULL];
                 if (attributes != nil
                     && [[attributes fileType] isEqualToString:NSFileTypeRegular]
-                    && [attributes fileSize] == [item.node itemSize]) {
+                    && [attributes fileSize] == expectedSize) {
                     item.restored = YES;
                     restoredThisRound++;
                     printf("already restored %s\n", [item.destPath UTF8String]);
@@ -479,13 +480,52 @@
     }
 
     BOOL success = YES;
-    for (Arq7BlobLoc *blobLoc in [theNode dataBlobLocs]) {
-        NSData *blobData = [_blobReader dataForBlobLoc:blobLoc error:error];
-        if (blobData == nil) {
-            success = NO;
-            break;
+    if ([theNode isSparse]) {
+        // Sparse file (Tree version >= 4): the data blobs contain only the non-hole
+        // regions; the holes list gives the zero ranges. Seeking past written data
+        // leaves zero-filled ranges, which APFS stores sparsely.
+        NSArray *holes = [theNode holes];
+        NSUInteger holeIndex = 0;
+        unsigned long long logicalOffset = 0;
+        for (Arq7BlobLoc *blobLoc in [theNode dataBlobLocs]) {
+            NSData *blobData = [_blobReader dataForBlobLoc:blobLoc error:error];
+            if (blobData == nil) {
+                success = NO;
+                break;
+            }
+            NSUInteger dataOffset = 0;
+            while (dataOffset < [blobData length]) {
+                while (holeIndex < [holes count]
+                       && [[[holes objectAtIndex:holeIndex] objectAtIndex:0] unsignedLongLongValue] <= logicalOffset) {
+                    unsigned long long holeOffset = [[[holes objectAtIndex:holeIndex] objectAtIndex:0] unsignedLongLongValue];
+                    unsigned long long holeLength = [[[holes objectAtIndex:holeIndex] objectAtIndex:1] unsignedLongLongValue];
+                    if (holeOffset + holeLength > logicalOffset) {
+                        logicalOffset = holeOffset + holeLength;
+                    }
+                    holeIndex++;
+                }
+                unsigned long long nextBoundary = holeIndex < [holes count]
+                    ? [[[holes objectAtIndex:holeIndex] objectAtIndex:0] unsignedLongLongValue]
+                    : ULLONG_MAX;
+                NSUInteger writeLength = (NSUInteger)MIN((unsigned long long)([blobData length] - dataOffset), nextBoundary - logicalOffset);
+                [fh seekToFileOffset:logicalOffset];
+                [fh writeData:[blobData subdataWithRange:NSMakeRange(dataOffset, writeLength)]];
+                logicalOffset += writeLength;
+                dataOffset += writeLength;
+            }
         }
-        [fh writeData:blobData];
+        if (success) {
+            [fh truncateFileAtOffset:[theNode sparseLogicalSize]];
+        }
+    } else {
+        for (Arq7BlobLoc *blobLoc in [theNode dataBlobLocs]) {
+            NSData *blobData = [_blobReader dataForBlobLoc:blobLoc error:error];
+            if (blobData == nil) {
+                success = NO;
+                break;
+            }
+            [fh writeData:blobData];
+        }
     }
     [fh closeFile];
 

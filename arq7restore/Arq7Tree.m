@@ -24,6 +24,10 @@
         if (![IntegerIO readUInt32:&_version from:bis error:error]) {
             return nil;
         }
+        if (_version > 4) {
+            SETNSERROR(@"Arq7TreeErrorDomain", -1, @"tree version %u is newer than this build supports (max 4); check for an updated data format specification", _version);
+            return nil;
+        }
         uint64_t count = 0;
         if (![IntegerIO readUInt64:&count from:bis error:error]) {
             return nil;

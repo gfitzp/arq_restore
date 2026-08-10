@@ -99,4 +99,14 @@
 - (uint32_t)winAttrs;
 - (uint32_t)reparseTag;
 - (BOOL)reparsePointIsDirectory;
+
+// Tree version >= 4 fields:
+- (int64_t)addedTime_sec;
+- (int64_t)addedTime_nsec;
+- (uint32_t)documentId;
+- (BOOL)hasDocumentId;
+- (BOOL)isSparse;
+- (uint64_t)sparseLogicalSize;
+// Array of 2-element NSArrays: [NSNumber offset, NSNumber length], sorted by offset.
+- (NSArray *)holes;
 @end
