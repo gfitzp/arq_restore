@@ -14,6 +14,7 @@
 #import "BufferedInputStream.h"
 #import "Item.h"
 #import "ByteSize.h"
+#import "Spinner.h"
 #include <sys/stat.h>
 #include <utime.h>
 
@@ -55,6 +56,8 @@
     NSSet *_archivedObjectPaths;
     NSMutableSet *_readyObjectPaths;    // archived objects confirmed restored
     NSDate *_lastExtensionDate;
+    Spinner *_spinner;
+    NSUInteger _collectedCount;
 }
 @end
 
@@ -84,6 +87,7 @@
         _glacierRestoreDays = theGlacierRestoreDays;
         _pollMinutes = thePollMinutes;
         _delegate = theDelegate;
+        _spinner = [[Spinner alloc] init];
     }
     return self;
 }
@@ -145,6 +149,22 @@
 
     _fileItems = [NSMutableArray array];
     _dirItems = [NSMutableArray array];
+
+    [_spinner start:@"scanning backup contents"];
+    BOOL collected = [self collectWorkItemsFromRootTree:rootTree error:error];
+    [_spinner stop];
+    if (!collected) {
+        return NO;
+    }
+
+    return [self runRestoreLoop:error];
+}
+
+
+#pragma mark internal
+
+// Walks to _relativePath (if any) and gathers the file/directory work items.
+- (BOOL)collectWorkItemsFromRootTree:(Arq7Tree *)rootTree error:(NSError **)error {
     NSFileManager *fm = [NSFileManager defaultManager];
 
     // Walk to relative path if specified.
@@ -200,20 +220,13 @@
             SETNSERROR([self errorDomain], -1, @"unable to resolve relative path '%@'", _relativePath);
             return NO;
         }
-    } else {
-        if (![fm createDirectoryAtPath:_destinationPath withIntermediateDirectories:YES attributes:nil error:error]) {
-            return NO;
-        }
-        if (![self collectTree:rootTree toPath:_destinationPath error:error]) {
-            return NO;
-        }
+        return YES;
     }
-
-    return [self runRestoreLoop:error];
+    if (![fm createDirectoryAtPath:_destinationPath withIntermediateDirectories:YES attributes:nil error:error]) {
+        return NO;
+    }
+    return [self collectTree:rootTree toPath:_destinationPath error:error];
 }
-
-
-#pragma mark internal
 
 // Creates the directory structure and gathers file/directory work items.
 - (BOOL)collectTree:(Arq7Tree *)theTree toPath:(NSString *)theDestPath error:(NSError **)error {
@@ -223,6 +236,10 @@
         Arq7Node *childNode = [theTree childNodeWithName:childName];
         if ([childNode deleted]) {
             continue;
+        }
+        _collectedCount++;
+        if (_collectedCount % 200 == 0) {
+            [_spinner setLabel:[NSString stringWithFormat:@"scanning backup contents (%lu items)", (unsigned long)_collectedCount]];
         }
 
         NSString *childPath = [theDestPath stringByAppendingPathComponent:childName];
@@ -285,7 +302,11 @@
     for (NSString *objectPath in allObjectPaths) {
         [parentDirs addObject:[objectPath stringByDeletingLastPathComponent]];
     }
+    NSUInteger listedDirCount = 0;
+    [_spinner start:@"checking storage classes"];
     for (NSString *dir in parentDirs) {
+        listedDirCount++;
+        [_spinner setLabel:[NSString stringWithFormat:@"checking storage classes (%lu of %lu directories)", (unsigned long)listedDirCount, (unsigned long)[parentDirs count]]];
         NSError *myError = nil;
         NSDictionary *itemsByName = [_conn itemsByNameAtPath:dir targetConnectionDelegate:_delegate error:&myError];
         if (itemsByName == nil) {
@@ -303,6 +324,7 @@
             }
         }
     }
+    [_spinner stop];
     _archivedObjectPaths = archived;
     _readyObjectPaths = [NSMutableSet set];
 
@@ -336,9 +358,11 @@
         NSUInteger restoredThisRound = 0;
         NSUInteger waitingCount = 0;
         NSUInteger permanentFailures = 0;
+        NSUInteger processedCount = 0;
         NSUInteger headBudget = HEAD_BUDGET_PER_ROUND;
         NSMutableSet *notReadyThisRound = [NSMutableSet set];
 
+        [_spinner start:[NSString stringWithFormat:@"round %lu: checking files", (unsigned long)round]];
         for (Arq7RestoreWorkItem *item in _fileItems) {
             if (item.restored) {
                 continue;
@@ -346,6 +370,11 @@
             if (item.attempts >= MAX_FILE_ATTEMPTS) {
                 permanentFailures++;
                 continue;
+            }
+            processedCount++;
+            if (processedCount % 25 == 0) {
+                [_spinner setLabel:[NSString stringWithFormat:@"round %lu: %lu restored, %lu waiting on thaw (checking)",
+                                    (unsigned long)round, (unsigned long)restoredThisRound, (unsigned long)waitingCount]];
             }
             @autoreleasepool {
                 // Resume support: a file already present with the expected size is considered done.
@@ -356,7 +385,7 @@
                     && [attributes fileSize] == expectedSize) {
                     item.restored = YES;
                     restoredThisRound++;
-                    printf("already restored %s\n", [item.destPath UTF8String]);
+                    [_spinner printLine:[NSString stringWithFormat:@"already restored %@", item.destPath]];
                     continue;
                 }
 
@@ -408,6 +437,7 @@
             }
         }
 
+        [_spinner stop];
         if (waitingCount == 0) {
             if (permanentFailures > 0) {
                 [self applyCollectedDirectoryMetadata];
@@ -445,7 +475,16 @@
                (unsigned long)round, -[startDate timeIntervalSinceNow] / 3600.0,
                (unsigned long)restoredThisRound, (unsigned long)waitingCount, (unsigned long)_pollMinutes);
         fflush(stdout);
-        [NSThread sleepForTimeInterval:(NSTimeInterval)_pollMinutes * 60.0];
+        NSUInteger secondsRemaining = _pollMinutes * 60;
+        [_spinner start:@""];
+        while (secondsRemaining > 0) {
+            [_spinner setLabel:[NSString stringWithFormat:@"%lu file%s waiting on thaw; next check in %lu:%02lu",
+                                (unsigned long)waitingCount, waitingCount == 1 ? "" : "s",
+                                (unsigned long)(secondsRemaining / 60), (unsigned long)(secondsRemaining % 60)]];
+            [NSThread sleepForTimeInterval:1.0];
+            secondsRemaining--;
+        }
+        [_spinner stop];
     }
 
     [self applyCollectedDirectoryMetadata];
@@ -484,6 +523,13 @@
         return NO;
     }
 
+    unsigned long long totalStoredBytes = 0;
+    for (Arq7BlobLoc *bl in [theNode dataBlobLocs]) {
+        totalStoredBytes += [bl length];
+    }
+    unsigned long long fetchedStoredBytes = 0;
+    NSString *displayName = [thePath lastPathComponent];
+
     BOOL success = YES;
     if ([theNode isSparse]) {
         // Sparse file (Tree version >= 4): the data blobs contain only the non-hole
@@ -493,11 +539,14 @@
         NSUInteger holeIndex = 0;
         unsigned long long logicalOffset = 0;
         for (Arq7BlobLoc *blobLoc in [theNode dataBlobLocs]) {
+            [_spinner setLabel:[NSString stringWithFormat:@"downloading %@ (%@ of %@)", displayName,
+                                [ByteSize descriptionForSize:fetchedStoredBytes], [ByteSize descriptionForSize:totalStoredBytes]]];
             NSData *blobData = [_blobReader dataForBlobLoc:blobLoc error:error];
             if (blobData == nil) {
                 success = NO;
                 break;
             }
+            fetchedStoredBytes += [blobLoc length];
             NSUInteger dataOffset = 0;
             while (dataOffset < [blobData length]) {
                 while (holeIndex < [holes count]
@@ -524,11 +573,14 @@
         }
     } else {
         for (Arq7BlobLoc *blobLoc in [theNode dataBlobLocs]) {
+            [_spinner setLabel:[NSString stringWithFormat:@"downloading %@ (%@ of %@)", displayName,
+                                [ByteSize descriptionForSize:fetchedStoredBytes], [ByteSize descriptionForSize:totalStoredBytes]]];
             NSData *blobData = [_blobReader dataForBlobLoc:blobLoc error:error];
             if (blobData == nil) {
                 success = NO;
                 break;
             }
+            fetchedStoredBytes += [blobLoc length];
             [fh writeData:blobData];
         }
     }
@@ -560,7 +612,7 @@
         // Non-fatal.
     }
 
-    printf("restored %s\n", [thePath UTF8String]);
+    [_spinner printLine:[NSString stringWithFormat:@"restored %@", thePath]];
     return YES;
 }
 
