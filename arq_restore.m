@@ -48,8 +48,9 @@ static void printUsage(const char *exeName) {
     fprintf(stderr, "\t%s [-l loglevel] listtree [-record id] [-recursive] <target_nickname> <computer_uuid> <folder_uuid> [relative_path]\n", exeName);
     fprintf(stderr, "\t\t(lists one folder level; pass a relative_path to browse deeper, -recursive for the full subtree)\n");
     fprintf(stderr, "\t%s [-l loglevel] listbackups <target_nickname> <computer_uuid> <folder_uuid>\n", exeName);
-    fprintf(stderr, "\t%s [-l loglevel] restore [-record id] [-tier bulk|standard|expedited] [-days n] [-poll n] <target_nickname> <computer_uuid> <folder_uuid> [relative_path]\n", exeName);
-    fprintf(stderr, "\t%s [-l loglevel] thaw [-record id] [-tier bulk|standard|expedited] [-days n] [-status] [-replan] <target_nickname> <computer_uuid> <folder_uuid> [relative_path]\n", exeName);
+    fprintf(stderr, "\t%s [-l loglevel] restore [-record id] [-cdn] [-tier bulk|standard|expedited] [-days n] [-poll n] <target_nickname> <computer_uuid> <folder_uuid> [relative_path]\n", exeName);
+    fprintf(stderr, "\t%s [-l loglevel] thaw [-record id] [-cdn] [-tier bulk|standard|expedited] [-days n] [-status] [-replan] <target_nickname> <computer_uuid> <folder_uuid> [relative_path]\n", exeName);
+    fprintf(stderr, "\t%s [-l loglevel] cdnurl <object_key> [expiry_seconds]\n", exeName);
     fprintf(stderr, "\t%s [-l loglevel] clearcache <target_nickname>\n", exeName);
     fprintf(stderr, "\n");
     fprintf(stderr, "listbackups shows the record_id and date of every backup snapshot; pass\n");
@@ -61,6 +62,12 @@ static void printUsage(const char *exeName) {
     fprintf(stderr, "objects it still needs. It can be interrupted and re-run; files already restored\n");
     fprintf(stderr, "are skipped. thaw issues the same restore requests without downloading anything\n");
     fprintf(stderr, "(useful for pre-warming); -status samples thaw progress.\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "-cdn downloads object data through the CloudFront distribution created by\n");
+    fprintf(stderr, "infra/setup-cloudfront-cdn.sh (config in ~/.arq_restore_cdn/cdn-config.env,\n");
+    fprintf(stderr, "override with ARQ_CDN_CONFIG) instead of paying per-GB S3 egress. Listing,\n");
+    fprintf(stderr, "thaw-status and restore requests still use the S3 API. cdnurl prints a signed\n");
+    fprintf(stderr, "URL for an object key, for testing with curl.\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "encryption passwords: after a correct password is entered once for an Arq 7\n");
     fprintf(stderr, "backup set it is saved to the macOS keychain (keyed by plan UUID) and reused\n");

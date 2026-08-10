@@ -44,8 +44,17 @@
 #import "IntegerIO.h"
 #import "DataInputStream.h"
 #import "BufferedInputStream.h"
+#import "CdnFetcher.h"
+
+static CdnFetcher *theSharedCdnFetcher = nil;
 
 @implementation TargetConnection
++ (void)setSharedCdnFetcher:(CdnFetcher *)theFetcher {
+    theSharedCdnFetcher = theFetcher;
+}
++ (CdnFetcher *)sharedCdnFetcher {
+    return theSharedCdnFetcher;
+}
 - (id)initWithTarget:(Target *)theTarget {
     if (self = [super init]) {
         target = theTarget;
@@ -205,6 +214,11 @@
     return [self contentsOfRange:NSMakeRange(NSNotFound, 0) ofFileAtPath:thePath delegate:theDelegate error:error];
 }
 - (NSData *)contentsOfRange:(NSRange)theRange ofFileAtPath:(NSString *)thePath delegate:(id<TargetConnectionDelegate>)theDelegate error:(NSError **)error {
+    CdnFetcher *cdnFetcher = theSharedCdnFetcher;
+    if (cdnFetcher != nil && [thePath hasPrefix:[pathPrefix stringByAppendingString:@"/"]]) {
+        NSString *objectKey = [thePath substringFromIndex:[pathPrefix length] + 1];
+        return [cdnFetcher contentsOfRange:theRange ofObjectKey:objectKey error:error];
+    }
     return [[self remoteFS:error] contentsOfRange:theRange ofFileAtPath:thePath dataTransferDelegate:nil targetConnectionDelegate:theDelegate error:error];
 }
 - (BOOL)writeData:(NSData *)theData toFileAtPath:(NSString *)thePath dataTransferDelegate:(id <DataTransferDelegate>)theDataTransferDelegate targetConnectionDelegate:(id <TargetConnectionDelegate>)theTargetConnectionDelegate error:(NSError **)error {

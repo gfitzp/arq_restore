@@ -76,6 +76,7 @@
 #import "KeychainFactory.h"
 #import "KeychainItem.h"
 #import "Keychain.h"
+#import "CdnFetcher.h"
 
 static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encryption password";
 
@@ -127,6 +128,8 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
         return [self thaw:args error:error];
     } else if ([cmd isEqualToString:@"listbackups"]) {
         return [self listBackups:args error:error];
+    } else if ([cmd isEqualToString:@"cdnurl"]) {
+        return [self cdnUrl:args error:error];
     } else if ([cmd isEqualToString:@"clearcache"]) {
         return [self clearCache:args error:error];
     } else {
@@ -554,7 +557,7 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
 - (BOOL)listTree:(NSArray *)args error:(NSError **)error {
     NSString *backupRecordId = nil;
     BOOL recursive = NO;
-    args = [self argsByStrippingGlacierOptions:args tier:NULL days:NULL pollMinutes:NULL recordId:&backupRecordId recursive:&recursive replan:NULL statusOnly:NULL error:error];
+    args = [self argsByStrippingGlacierOptions:args tier:NULL days:NULL pollMinutes:NULL recordId:&backupRecordId recursive:&recursive cdn:NULL replan:NULL statusOnly:NULL error:error];
     if (args == nil) {
         return NO;
     }
@@ -834,9 +837,9 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
 }
 
 // Strips -tier <bulk|standard|expedited>, -days <n>, -poll <minutes>, -record <id>,
-// -recursive, -replan and -status from theArgs, returning the remaining positional
-// arguments. Pass NULL for options a command doesn't accept.
-- (NSArray *)argsByStrippingGlacierOptions:(NSArray *)theArgs tier:(int *)outTier days:(NSUInteger *)outDays pollMinutes:(NSUInteger *)outPollMinutes recordId:(NSString **)outRecordId recursive:(BOOL *)outRecursive replan:(BOOL *)outReplan statusOnly:(BOOL *)outStatusOnly error:(NSError **)error {
+// -recursive, -cdn, -replan and -status from theArgs, returning the remaining
+// positional arguments. Pass NULL for options a command doesn't accept.
+- (NSArray *)argsByStrippingGlacierOptions:(NSArray *)theArgs tier:(int *)outTier days:(NSUInteger *)outDays pollMinutes:(NSUInteger *)outPollMinutes recordId:(NSString **)outRecordId recursive:(BOOL *)outRecursive cdn:(BOOL *)outCdn replan:(BOOL *)outReplan statusOnly:(BOOL *)outStatusOnly error:(NSError **)error {
     NSMutableArray *ret = [NSMutableArray array];
     NSUInteger i = 0;
     while (i < [theArgs count]) {
@@ -898,9 +901,10 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
                 *outDays = (NSUInteger)days;
             }
             i += 2;
-        } else if ([arg isEqualToString:@"-replan"] || [arg isEqualToString:@"-status"] || [arg isEqualToString:@"-recursive"]) {
+        } else if ([arg isEqualToString:@"-replan"] || [arg isEqualToString:@"-status"] || [arg isEqualToString:@"-recursive"] || [arg isEqualToString:@"-cdn"]) {
             BOOL *flag = [arg isEqualToString:@"-replan"] ? outReplan
-                       : ([arg isEqualToString:@"-status"] ? outStatusOnly : outRecursive);
+                       : ([arg isEqualToString:@"-status"] ? outStatusOnly
+                       : ([arg isEqualToString:@"-recursive"] ? outRecursive : outCdn));
             if (flag == NULL) {
                 SETNSERROR([self errorDomain], ERROR_USAGE, @"%@ is not valid for this command", arg);
                 return nil;
@@ -913,6 +917,47 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
         }
     }
     return ret;
+}
+
+// Routes object-data downloads through the CloudFront CDN for the rest of the
+// process. Fails if the CDN config's bucket doesn't match the target's bucket.
+- (BOOL)enableCdnWithTargetConnection:(TargetConnection *)theConn error:(NSError **)error {
+    CdnFetcher *fetcher = [[CdnFetcher alloc] initWithConfigPath:[CdnFetcher defaultConfigPath] error:error];
+    if (fetcher == nil) {
+        return NO;
+    }
+    if ([fetcher bucket] != nil) {
+        NSString *expectedPrefix = [@"/" stringByAppendingString:[fetcher bucket]];
+        if (![[theConn pathPrefix] isEqualToString:expectedPrefix]) {
+            SETNSERROR([self errorDomain], -1, @"the CDN config is for bucket '%@' but the target's bucket path is '%@'", [fetcher bucket], [theConn pathPrefix]);
+            return NO;
+        }
+    }
+    [TargetConnection setSharedCdnFetcher:fetcher];
+    printf("object data will be downloaded via CloudFront (%s)\n", [[fetcher domain] UTF8String]);
+    return YES;
+}
+
+- (BOOL)cdnUrl:(NSArray *)args error:(NSError **)error {
+    if ([args count] != 3 && [args count] != 4) {
+        SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid arguments");
+        return NO;
+    }
+    NSTimeInterval expiry = [args count] == 4 ? [[args objectAtIndex:3] doubleValue] : 600;
+    if (expiry <= 0) {
+        SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid expiry seconds");
+        return NO;
+    }
+    CdnFetcher *fetcher = [[CdnFetcher alloc] initWithConfigPath:[CdnFetcher defaultConfigPath] error:error];
+    if (fetcher == nil) {
+        return NO;
+    }
+    NSString *url = [fetcher signedURLStringForObjectKey:[args objectAtIndex:2] expiresIn:expiry error:error];
+    if (url == nil) {
+        return NO;
+    }
+    printf("%s\n", [url UTF8String]);
+    return YES;
 }
 
 - (NSString *)savedEncryptionPasswordForPlanUUID:(NSString *)thePlanUUID {
@@ -1140,8 +1185,9 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
     NSUInteger glacierRestoreDays = DEFAULT_GLACIER_RESTORE_DAYS;
     BOOL replan = NO;
     BOOL statusOnly = NO;
+    BOOL useCdn = NO;
     NSString *backupRecordId = nil;
-    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:NULL recordId:&backupRecordId recursive:NULL replan:&replan statusOnly:&statusOnly error:error];
+    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:NULL recordId:&backupRecordId recursive:NULL cdn:&useCdn replan:&replan statusOnly:&statusOnly error:error];
     if (args == nil) {
         return NO;
     }
@@ -1169,6 +1215,9 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
     }
     if (![isArq7 boolValue]) {
         SETNSERROR([self errorDomain], -1, @"the thaw command currently supports only Arq 7 format backup sets");
+        return NO;
+    }
+    if (useCdn && ![self enableCdnWithTargetConnection:conn error:error]) {
         return NO;
     }
     Arq7BackupSet *bs = [Arq7BackupSet backupSetWithPlanUUID:theUUID targetConnection:conn delegate:nil error:error];
@@ -1311,8 +1360,9 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
     int glacierRetrievalTier = GLACIER_RETRIEVAL_TIER_BULK;
     NSUInteger glacierRestoreDays = DEFAULT_GLACIER_RESTORE_DAYS;
     NSUInteger pollMinutes = DEFAULT_THAW_POLL_MINUTES;
+    BOOL useCdn = NO;
     NSString *backupRecordId = nil;
-    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:&pollMinutes recordId:&backupRecordId recursive:NULL replan:NULL statusOnly:NULL error:error];
+    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:&pollMinutes recordId:&backupRecordId recursive:NULL cdn:&useCdn replan:NULL statusOnly:NULL error:error];
     if (args == nil) {
         return NO;
     }
@@ -1349,6 +1399,10 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
 
         Arq7KeySet *keySet = nil;
         if (![self loadArq7KeySet:&keySet forBackupSet:bs targetConnection:conn planUUID:theUUID error:error]) {
+            return NO;
+        }
+
+        if (useCdn && ![self enableCdnWithTargetConnection:conn error:error]) {
             return NO;
         }
 

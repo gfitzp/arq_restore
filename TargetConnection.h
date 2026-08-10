@@ -33,6 +33,7 @@
 @class Target;
 #import "RemoteFS.h"
 @class Item;
+@class CdnFetcher;
 @protocol DataTransferDelegate;
 @protocol DeleteDelegate;
 
@@ -47,6 +48,12 @@
     NSLock *lock;
 }
 - (id)initWithTarget:(Target *)theTarget;
+
+// When set, contentsOfFileAtPath/contentsOfRange fetch object data through the
+// CloudFront CDN instead of the S3 API. Listing, HEAD and restore requests are
+// unaffected. Applies to every connection in the process.
++ (void)setSharedCdnFetcher:(CdnFetcher *)theFetcher;
++ (CdnFetcher *)sharedCdnFetcher;
 
 - (NSString *)pathPrefix;
 
