@@ -89,6 +89,94 @@
     return nil;
 }
 
++ (NSArray *)backupRecordPathsForPlanUUID:(NSString *)thePlanUUID
+                               folderUUID:(NSString *)theFolderUUID
+                         targetConnection:(TargetConnection *)theConn
+                                 delegate:(id <TargetConnectionDelegate>)theDelegate
+                                    error:(NSError **)error {
+    NSString *backupRecordsPath = [NSString stringWithFormat:@"%@/%@/backupfolders/%@/backuprecords",
+                                   [theConn pathPrefix], thePlanUUID, theFolderUUID];
+    NSDictionary *dirsByName = [theConn itemsByNameAtPath:backupRecordsPath
+                                targetConnectionDelegate:theDelegate
+                                                   error:error];
+    if (dirsByName == nil) {
+        return nil;
+    }
+
+    NSMutableArray *ret = [NSMutableArray array];
+    NSArray *sortedDirNames = [[dirsByName allKeys] sortedArrayUsingSelector:@selector(compare:)];
+    for (NSString *dirName in sortedDirNames) {
+        if ([dirName isEqualToString:@".DS_Store"] || [dirName isEqualToString:@"@eaDir"]) {
+            continue;
+        }
+        if (![[dirsByName objectForKey:dirName] isDirectory]) {
+            continue;
+        }
+        NSString *subDir = [backupRecordsPath stringByAppendingPathComponent:dirName];
+        NSDictionary *recordsByName = [theConn itemsByNameAtPath:subDir
+                                        targetConnectionDelegate:theDelegate
+                                                           error:error];
+        if (recordsByName == nil) {
+            return nil;
+        }
+        NSArray *sortedRecordNames = [[recordsByName allKeys] sortedArrayUsingSelector:@selector(compare:)];
+        for (NSString *recordName in sortedRecordNames) {
+            if ([recordName isEqualToString:@".DS_Store"] || [recordName isEqualToString:@"@eaDir"]) {
+                continue;
+            }
+            [ret addObject:[subDir stringByAppendingPathComponent:recordName]];
+        }
+    }
+    return ret;
+}
+
++ (NSNumber *)epochOfBackupRecordPath:(NSString *)thePath {
+    NSString *name = [[thePath lastPathComponent] stringByDeletingPathExtension];
+    NSString *dir = [[thePath stringByDeletingLastPathComponent] lastPathComponent];
+    NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+    if ([name length] == 0 || [dir length] == 0
+        || [name rangeOfCharacterFromSet:nonDigits].location != NSNotFound
+        || [dir rangeOfCharacterFromSet:nonDigits].location != NSNotFound) {
+        return nil;
+    }
+    NSString *combined = [dir stringByAppendingString:name];
+    return [NSNumber numberWithUnsignedLongLong:strtoull([combined UTF8String], NULL, 10)];
+}
+
++ (Arq7BackupRecord *)backupRecordWithId:(NSString *)theRecordId
+                             forPlanUUID:(NSString *)thePlanUUID
+                              folderUUID:(NSString *)theFolderUUID
+                        targetConnection:(TargetConnection *)theConn
+                                  keySet:(Arq7KeySet *)theKeySet
+                                delegate:(id <TargetConnectionDelegate>)theDelegate
+                                   error:(NSError **)error {
+    NSArray *paths = [self backupRecordPathsForPlanUUID:thePlanUUID
+                                             folderUUID:theFolderUUID
+                                       targetConnection:theConn
+                                               delegate:theDelegate
+                                                  error:error];
+    if (paths == nil) {
+        return nil;
+    }
+    unsigned long long wantedEpoch = strtoull([theRecordId UTF8String], NULL, 10);
+    for (NSString *path in paths) {
+        NSString *fragment = [NSString stringWithFormat:@"%@/%@",
+                              [[path stringByDeletingLastPathComponent] lastPathComponent],
+                              [[path lastPathComponent] stringByDeletingPathExtension]];
+        NSNumber *epoch = [self epochOfBackupRecordPath:path];
+        BOOL match = [theRecordId isEqualToString:fragment]
+                  || [theRecordId isEqualToString:[path lastPathComponent]]
+                  || (epoch != nil && wantedEpoch != 0 && [epoch unsignedLongLongValue] == wantedEpoch);
+        if (match) {
+            return [self backupRecordAtPath:path targetConnection:theConn keySet:theKeySet delegate:theDelegate error:error];
+        }
+    }
+    SETNSERROR(@"Arq7BackupRecordErrorDomain", ERROR_NOT_FOUND,
+               @"backup record '%@' not found for plan %@ folder %@ (use the listbackups command to see available records)",
+               theRecordId, thePlanUUID, theFolderUUID);
+    return nil;
+}
+
 + (Arq7BackupRecord *)backupRecordAtPath:(NSString *)thePath
                         targetConnection:(TargetConnection *)theConn
                                   keySet:(Arq7KeySet *)theKeySet

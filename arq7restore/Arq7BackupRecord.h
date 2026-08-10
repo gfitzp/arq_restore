@@ -26,4 +26,27 @@
                                                  keySet:(Arq7KeySet *)theKeySet
                                                delegate:(id <TargetConnectionDelegate>)theDelegate
                                                   error:(NSError **)error;
+
+// Returns the full paths of all backup record files for the folder, oldest first.
+// Requires no key set: nothing is downloaded or decrypted.
++ (NSArray *)backupRecordPathsForPlanUUID:(NSString *)thePlanUUID
+                               folderUUID:(NSString *)theFolderUUID
+                         targetConnection:(TargetConnection *)theConn
+                                 delegate:(id <TargetConnectionDelegate>)theDelegate
+                                    error:(NSError **)error;
+
+// The record's creation time in epoch seconds, derived from its path
+// (backuprecords/DDDDD/NNNNNNN.backuprecord => DDDDDNNNNNNN), or nil.
++ (NSNumber *)epochOfBackupRecordPath:(NSString *)thePath;
+
+// Loads the backup record matching theRecordId, which may be the epoch id shown
+// by listbackups (e.g. "1616936407") or a "DDDDD/NNNNNNN" path fragment.
+// May return an incomplete record — callers should check isComplete and warn.
++ (Arq7BackupRecord *)backupRecordWithId:(NSString *)theRecordId
+                             forPlanUUID:(NSString *)thePlanUUID
+                              folderUUID:(NSString *)theFolderUUID
+                        targetConnection:(TargetConnection *)theConn
+                                  keySet:(Arq7KeySet *)theKeySet
+                                delegate:(id <TargetConnectionDelegate>)theDelegate
+                                   error:(NSError **)error;
 @end

@@ -68,9 +68,16 @@
 #import "Arq6Snapshot.h"
 #import "Arq6SnapshotVolume.h"
 #import "Arq6Restorer.h"
+#import "Arq7ThawPlanner.h"
+#import "Item.h"
+#import "ByteSize.h"
+#import "UserLibrary_Arq.h"
 #import "TargetConnection.h"
 
 #define BUFSIZE (65536)
+#define DEFAULT_GLACIER_RESTORE_DAYS (2)
+#define DEFAULT_THAW_POLL_MINUTES (30)
+#define THAW_STATUS_SAMPLE_SIZE (500)
 
 @implementation ArqRestoreCommand
 - (NSString *)errorDomain {
@@ -111,6 +118,10 @@
         return [self listTree:args error:error];
     } else if ([cmd isEqualToString:@"restore"]) {
         return [self restore:args error:error];
+    } else if ([cmd isEqualToString:@"thaw"]) {
+        return [self thaw:args error:error];
+    } else if ([cmd isEqualToString:@"listbackups"]) {
+        return [self listBackups:args error:error];
     } else if ([cmd isEqualToString:@"clearcache"]) {
         return [self clearCache:args error:error];
     } else {
@@ -551,6 +562,11 @@
     return YES;
 }
 - (BOOL)listTree:(NSArray *)args error:(NSError **)error {
+    NSString *backupRecordId = nil;
+    args = [self argsByStrippingGlacierOptions:args tier:NULL days:NULL pollMinutes:NULL recordId:&backupRecordId replan:NULL statusOnly:NULL error:error];
+    if (args == nil) {
+        return NO;
+    }
     if ([args count] != 5) {
         SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid arguments");
         return NO;
@@ -574,6 +590,10 @@
     if (isArq7 == nil) {
         return NO;
     }
+    if (backupRecordId != nil && ![isArq7 boolValue]) {
+        SETNSERROR([self errorDomain], -1, @"-record is currently supported only for Arq 7 format backup sets");
+        return NO;
+    }
 
     if ([isArq7 boolValue]) {
         Arq7BackupSet *bs = [Arq7BackupSet backupSetWithPlanUUID:theUUID targetConnection:conn delegate:nil error:error];
@@ -582,31 +602,36 @@
         }
 
         Arq7KeySet *keySet = nil;
-        if ([bs isEncrypted]) {
-            NSString *theEncryptionPassword = [self readPasswordWithPrompt:@"enter encryption password:" error:error];
-            if (theEncryptionPassword == nil) {
-                return NO;
-            }
-            printf("\n");
-            NSString *keysetPath = [NSString stringWithFormat:@"%@/%@/encryptedkeyset.dat", [conn pathPrefix], theUUID];
-            NSData *keysetData = [conn contentsOfFileAtPath:keysetPath delegate:nil error:error];
-            if (keysetData == nil) {
-                return NO;
-            }
-            keySet = [[Arq7KeySet alloc] initWithEncryptedData:keysetData encryptionPassword:theEncryptionPassword error:error];
-            if (keySet == nil) {
-                return NO;
-            }
+        if (![self loadArq7KeySet:&keySet forBackupSet:bs targetConnection:conn planUUID:theUUID error:error]) {
+            return NO;
         }
 
         // Arq7 path: try backup record first.
         NSError *myError = nil;
-        Arq7BackupRecord *record = [Arq7BackupRecord mostRecentBackupRecordForPlanUUID:theUUID
-                                                                            folderUUID:theFolderUUID
-                                                                      targetConnection:conn
-                                                                                keySet:keySet
-                                                                              delegate:nil
-                                                                                 error:&myError];
+        Arq7BackupRecord *record = nil;
+        if (backupRecordId != nil) {
+            record = [Arq7BackupRecord backupRecordWithId:backupRecordId
+                                              forPlanUUID:theUUID
+                                               folderUUID:theFolderUUID
+                                         targetConnection:conn
+                                                   keySet:keySet
+                                                 delegate:nil
+                                                    error:error];
+            if (record == nil) {
+                return NO;
+            }
+            if (!record.isComplete) {
+                fprintf(stderr, "warning: backup record %s is incomplete (the backup did not finish); the listing may be missing files\n",
+                        [backupRecordId UTF8String]);
+            }
+        } else {
+            record = [Arq7BackupRecord mostRecentBackupRecordForPlanUUID:theUUID
+                                                              folderUUID:theFolderUUID
+                                                        targetConnection:conn
+                                                                  keySet:keySet
+                                                                delegate:nil
+                                                                   error:&myError];
+        }
         if (record != nil) {
             if (record.node == nil) {
                 SETNSERROR([self errorDomain], -1, @"backup record has no node (version %d)", record.version);
@@ -616,6 +641,7 @@
             printf("target   %s\n", [[target endpointDisplayName] UTF8String]);
             printf("plan     %s\n", [theUUID UTF8String]);
             printf("folder   %s\n", [theFolderUUID UTF8String]);
+            printf("backup   %s\n", [[record.creationDate description] UTF8String]);
 
             Arq7BlobReader *blobReader = [[Arq7BlobReader alloc] initWithPlanUUID:theUUID
                                                                  targetConnection:conn
@@ -753,7 +779,437 @@
     return YES;
 }
 
+// Strips -tier <bulk|standard|expedited>, -days <n>, -poll <minutes>, -record <id>,
+// -replan and -status from theArgs, returning the remaining positional arguments.
+// Pass NULL for options a command doesn't accept.
+- (NSArray *)argsByStrippingGlacierOptions:(NSArray *)theArgs tier:(int *)outTier days:(NSUInteger *)outDays pollMinutes:(NSUInteger *)outPollMinutes recordId:(NSString **)outRecordId replan:(BOOL *)outReplan statusOnly:(BOOL *)outStatusOnly error:(NSError **)error {
+    NSMutableArray *ret = [NSMutableArray array];
+    NSUInteger i = 0;
+    while (i < [theArgs count]) {
+        NSString *arg = [theArgs objectAtIndex:i];
+        if ([arg isEqualToString:@"-record"]) {
+            if (outRecordId == NULL) {
+                SETNSERROR([self errorDomain], ERROR_USAGE, @"%@ is not valid for this command", arg);
+                return nil;
+            }
+            if (i + 1 >= [theArgs count]) {
+                SETNSERROR([self errorDomain], ERROR_USAGE, @"missing value for %@", arg);
+                return nil;
+            }
+            *outRecordId = [theArgs objectAtIndex:i + 1];
+            i += 2;
+        } else if ([arg isEqualToString:@"-poll"]) {
+            if (outPollMinutes == NULL) {
+                SETNSERROR([self errorDomain], ERROR_USAGE, @"%@ is not valid for this command", arg);
+                return nil;
+            }
+            if (i + 1 >= [theArgs count]) {
+                SETNSERROR([self errorDomain], ERROR_USAGE, @"missing value for %@", arg);
+                return nil;
+            }
+            NSInteger minutes = [[theArgs objectAtIndex:i + 1] integerValue];
+            if (minutes < 1 || minutes > 720) {
+                SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid -poll value '%@' (expected 1 to 720 minutes)", [theArgs objectAtIndex:i + 1]);
+                return nil;
+            }
+            *outPollMinutes = (NSUInteger)minutes;
+            i += 2;
+        } else if ([arg isEqualToString:@"-tier"] || [arg isEqualToString:@"-days"]) {
+            if (([arg isEqualToString:@"-tier"] && outTier == NULL) || ([arg isEqualToString:@"-days"] && outDays == NULL)) {
+                SETNSERROR([self errorDomain], ERROR_USAGE, @"%@ is not valid for this command", arg);
+                return nil;
+            }
+            if (i + 1 >= [theArgs count]) {
+                SETNSERROR([self errorDomain], ERROR_USAGE, @"missing value for %@", arg);
+                return nil;
+            }
+            NSString *value = [theArgs objectAtIndex:i + 1];
+            if ([arg isEqualToString:@"-tier"]) {
+                if ([value caseInsensitiveCompare:@"bulk"] == NSOrderedSame) {
+                    *outTier = GLACIER_RETRIEVAL_TIER_BULK;
+                } else if ([value caseInsensitiveCompare:@"standard"] == NSOrderedSame) {
+                    *outTier = GLACIER_RETRIEVAL_TIER_STANDARD;
+                } else if ([value caseInsensitiveCompare:@"expedited"] == NSOrderedSame) {
+                    *outTier = GLACIER_RETRIEVAL_TIER_EXPEDITED;
+                } else {
+                    SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid -tier value '%@' (expected bulk, standard or expedited)", value);
+                    return nil;
+                }
+            } else {
+                NSInteger days = [value integerValue];
+                if (days < 1 || days > 30) {
+                    SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid -days value '%@' (expected 1 to 30)", value);
+                    return nil;
+                }
+                *outDays = (NSUInteger)days;
+            }
+            i += 2;
+        } else if ([arg isEqualToString:@"-replan"] || [arg isEqualToString:@"-status"]) {
+            BOOL *flag = [arg isEqualToString:@"-replan"] ? outReplan : outStatusOnly;
+            if (flag == NULL) {
+                SETNSERROR([self errorDomain], ERROR_USAGE, @"%@ is not valid for this command", arg);
+                return nil;
+            }
+            *flag = YES;
+            i++;
+        } else {
+            [ret addObject:arg];
+            i++;
+        }
+    }
+    return ret;
+}
+
+- (BOOL)loadArq7KeySet:(Arq7KeySet **)outKeySet forBackupSet:(Arq7BackupSet *)theBackupSet targetConnection:(TargetConnection *)theConn planUUID:(NSString *)theUUID error:(NSError **)error {
+    *outKeySet = nil;
+    if (![theBackupSet isEncrypted]) {
+        return YES;
+    }
+    NSString *theEncryptionPassword = [self readPasswordWithPrompt:@"enter encryption password:" error:error];
+    if (theEncryptionPassword == nil) {
+        return NO;
+    }
+    printf("\n");
+    NSString *keysetPath = [NSString stringWithFormat:@"%@/%@/encryptedkeyset.dat", [theConn pathPrefix], theUUID];
+    NSData *keysetData = [theConn contentsOfFileAtPath:keysetPath delegate:nil error:error];
+    if (keysetData == nil) {
+        return NO;
+    }
+    Arq7KeySet *keySet = [[Arq7KeySet alloc] initWithEncryptedData:keysetData encryptionPassword:theEncryptionPassword error:error];
+    if (keySet == nil) {
+        return NO;
+    }
+    *outKeySet = keySet;
+    return YES;
+}
+
+- (NSString *)thawPlanCachePathForPlanUUID:(NSString *)theUUID folderUUID:(NSString *)theFolderUUID relativePath:(NSString *)theRelativePath recordId:(NSString *)theRecordId {
+    NSString *cacheDir = [[UserLibrary arqCachePath] stringByAppendingPathComponent:@"thawplans"];
+    NSString *cacheKey = [NSString stringWithFormat:@"%@-%@", theUUID, theFolderUUID];
+    if (theRecordId != nil) {
+        cacheKey = [cacheKey stringByAppendingFormat:@"-r%@", [theRecordId stringByReplacingOccurrencesOfString:@"/" withString:@"_"]];
+    }
+    if (theRelativePath != nil) {
+        cacheKey = [cacheKey stringByAppendingFormat:@"-%08lx", (unsigned long)[theRelativePath hash]];
+    }
+    return [[cacheDir stringByAppendingPathComponent:cacheKey] stringByAppendingPathExtension:@"thawplan"];
+}
+
+- (BOOL)writeThawPlan:(NSDictionary *)theItems toPath:(NSString *)thePath {
+    NSMutableData *data = [NSMutableData data];
+    [data appendData:[@"# arq_restore thawplan v1\n" dataUsingEncoding:NSUTF8StringEncoding]];
+    for (NSString *objectPath in theItems) {
+        Arq7ThawPlanItem *item = [theItems objectForKey:objectPath];
+        NSString *line = [NSString stringWithFormat:@"%d\t%llu\t%lu\t%@\n",
+                          [item isPacked] ? 1 : 0,
+                          [item referencedBytes],
+                          (unsigned long)[item referencedBlobCount],
+                          objectPath];
+        [data appendData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    }
+    NSError *myError = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:[thePath stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:&myError]
+        || ![data writeToFile:thePath options:NSDataWritingAtomic error:&myError]) {
+        HSLogError(@"failed to cache thaw plan at %@: %@", thePath, myError);
+        return NO;
+    }
+    return YES;
+}
+
+- (NSDictionary *)readThawPlanAtPath:(NSString *)thePath {
+    NSString *contents = [NSString stringWithContentsOfFile:thePath encoding:NSUTF8StringEncoding error:NULL];
+    if (contents == nil) {
+        return nil;
+    }
+    NSMutableDictionary *ret = [NSMutableDictionary dictionary];
+    __block BOOL corrupt = NO;
+    [contents enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+        if ([line length] == 0 || [line hasPrefix:@"#"]) {
+            return;
+        }
+        NSArray *fields = [line componentsSeparatedByString:@"\t"];
+        if ([fields count] != 4) {
+            corrupt = YES;
+            *stop = YES;
+            return;
+        }
+        NSString *objectPath = [fields objectAtIndex:3];
+        Arq7ThawPlanItem *item = [[Arq7ThawPlanItem alloc] initWithObjectPath:objectPath
+                                                                     isPacked:[[fields objectAtIndex:0] intValue] != 0
+                                                              referencedBytes:strtoull([[fields objectAtIndex:1] UTF8String], NULL, 10)
+                                                          referencedBlobCount:(NSUInteger)[[fields objectAtIndex:2] integerValue]];
+        [ret setObject:item forKey:objectPath];
+    }];
+    if (corrupt || [ret count] == 0) {
+        return nil;
+    }
+    return ret;
+}
+
+- (NSDictionary *)thawPlanItemsForPlanUUID:(NSString *)theUUID folderUUID:(NSString *)theFolderUUID targetConnection:(TargetConnection *)theConn keySet:(Arq7KeySet *)theKeySet relativePath:(NSString *)theRelativePath recordId:(NSString *)theRecordId replan:(BOOL)theReplan error:(NSError **)error {
+    NSString *cachePath = [self thawPlanCachePathForPlanUUID:theUUID folderUUID:theFolderUUID relativePath:theRelativePath recordId:theRecordId];
+    if (!theReplan && [[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
+        NSDictionary *cached = [self readThawPlanAtPath:cachePath];
+        if (cached != nil) {
+            printf("loaded cached thaw plan of %lu objects (use -replan to rebuild)\n", (unsigned long)[cached count]);
+            return cached;
+        }
+        HSLogWarn(@"ignoring unreadable thaw plan cache at %@", cachePath);
+    }
+    Arq7ThawPlanner *planner = [[Arq7ThawPlanner alloc] initWithPlanUUID:theUUID
+                                                              folderUUID:theFolderUUID
+                                                        targetConnection:theConn
+                                                                  keySet:theKeySet
+                                                            relativePath:theRelativePath
+                                                          backupRecordId:theRecordId
+                                                                delegate:nil];
+    NSDictionary *items = [planner planItemsByObjectPath:error];
+    if (items == nil) {
+        return nil;
+    }
+    [self writeThawPlan:items toPath:cachePath];
+    return items;
+}
+
+- (BOOL)listBackups:(NSArray *)args error:(NSError **)error {
+    if ([args count] != 5) {
+        SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid arguments");
+        return NO;
+    }
+    Target *target = [[TargetFactory sharedTargetFactory] targetWithNickname:[args objectAtIndex:2]];
+    if (target == nil) {
+        SETNSERROR([self errorDomain], ERROR_NOT_FOUND, @"target not found");
+        return NO;
+    }
+    NSString *theUUID = [args objectAtIndex:3];
+    NSString *theFolderUUID = [args objectAtIndex:4];
+
+    TargetConnection *conn = [target newConnection:error];
+    if (conn == nil) {
+        return NO;
+    }
+    NSString *configPath = [NSString stringWithFormat:@"%@/%@/backupconfig.json", [conn pathPrefix], theUUID];
+    NSNumber *isArq7 = [conn fileExistsAtPath:configPath dataSize:NULL delegate:nil error:error];
+    if (isArq7 == nil) {
+        return NO;
+    }
+    if (![isArq7 boolValue]) {
+        SETNSERROR([self errorDomain], -1, @"the listbackups command currently supports only Arq 7 format backup sets");
+        return NO;
+    }
+
+    NSArray *recordPaths = [Arq7BackupRecord backupRecordPathsForPlanUUID:theUUID
+                                                               folderUUID:theFolderUUID
+                                                         targetConnection:conn
+                                                                 delegate:nil
+                                                                    error:error];
+    if (recordPaths == nil) {
+        return NO;
+    }
+    if ([recordPaths count] == 0) {
+        printf("no backup records found\n");
+        return YES;
+    }
+
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    [formatter setDateFormat:@"yyyy-MM-dd HH:mm:ss Z"];
+    printf("%-14s  %s\n", "record_id", "backup date");
+    for (NSString *recordPath in recordPaths) {
+        NSNumber *epoch = [Arq7BackupRecord epochOfBackupRecordPath:recordPath];
+        if (epoch != nil) {
+            NSDate *date = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)[epoch unsignedLongLongValue]];
+            printf("%-14llu  %s%s\n", [epoch unsignedLongLongValue],
+                   [[formatter stringFromDate:date] UTF8String],
+                   recordPath == [recordPaths lastObject] ? "  (latest)" : "");
+        } else {
+            printf("%-14s  %s\n", "?", [recordPath UTF8String]);
+        }
+    }
+    printf("\nrestore a specific backup with: restore -record <record_id> ...\n");
+    return YES;
+}
+
+- (BOOL)thaw:(NSArray *)args error:(NSError **)error {
+    int glacierRetrievalTier = GLACIER_RETRIEVAL_TIER_BULK;
+    NSUInteger glacierRestoreDays = DEFAULT_GLACIER_RESTORE_DAYS;
+    BOOL replan = NO;
+    BOOL statusOnly = NO;
+    NSString *backupRecordId = nil;
+    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:NULL recordId:&backupRecordId replan:&replan statusOnly:&statusOnly error:error];
+    if (args == nil) {
+        return NO;
+    }
+    if ([args count] != 5 && [args count] != 6) {
+        SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid arguments");
+        return NO;
+    }
+    Target *target = [[TargetFactory sharedTargetFactory] targetWithNickname:[args objectAtIndex:2]];
+    if (target == nil) {
+        SETNSERROR([self errorDomain], ERROR_NOT_FOUND, @"target not found");
+        return NO;
+    }
+    NSString *theUUID = [args objectAtIndex:3];
+    NSString *theFolderUUID = [args objectAtIndex:4];
+    NSString *theRelativePath = ([args count] == 6) ? [args objectAtIndex:5] : nil;
+
+    TargetConnection *conn = [target newConnection:error];
+    if (conn == nil) {
+        return NO;
+    }
+    NSString *configPath = [NSString stringWithFormat:@"%@/%@/backupconfig.json", [conn pathPrefix], theUUID];
+    NSNumber *isArq7 = [conn fileExistsAtPath:configPath dataSize:NULL delegate:nil error:error];
+    if (isArq7 == nil) {
+        return NO;
+    }
+    if (![isArq7 boolValue]) {
+        SETNSERROR([self errorDomain], -1, @"the thaw command currently supports only Arq 7 format backup sets");
+        return NO;
+    }
+    Arq7BackupSet *bs = [Arq7BackupSet backupSetWithPlanUUID:theUUID targetConnection:conn delegate:nil error:error];
+    if (bs == nil) {
+        return NO;
+    }
+    Arq7KeySet *keySet = nil;
+    if (![self loadArq7KeySet:&keySet forBackupSet:bs targetConnection:conn planUUID:theUUID error:error]) {
+        return NO;
+    }
+
+    NSDictionary *planItems = [self thawPlanItemsForPlanUUID:theUUID folderUUID:theFolderUUID targetConnection:conn keySet:keySet relativePath:theRelativePath recordId:backupRecordId replan:replan error:error];
+    if (planItems == nil) {
+        return NO;
+    }
+    unsigned long long referencedBytes = 0;
+    for (Arq7ThawPlanItem *item in [planItems allValues]) {
+        referencedBytes += [item referencedBytes];
+    }
+    printf("%lu unique objects referenced (%s of stored data)\n",
+           (unsigned long)[planItems count], [[ByteSize descriptionForSize:referencedBytes] UTF8String]);
+
+    // Determine storage class and size of each referenced object from directory listings.
+    NSMutableSet *parentDirs = [NSMutableSet set];
+    for (NSString *objectPath in planItems) {
+        [parentDirs addObject:[objectPath stringByDeletingLastPathComponent]];
+    }
+    printf("checking storage classes (listing %lu directories)\n", (unsigned long)[parentDirs count]);
+    NSMutableDictionary *targetItemsByObjectPath = [NSMutableDictionary dictionary];
+    for (NSString *dir in parentDirs) {
+        NSError *myError = nil;
+        NSDictionary *itemsByName = [conn itemsByNameAtPath:dir targetConnectionDelegate:nil error:&myError];
+        if (itemsByName == nil) {
+            HSLogWarn(@"unable to list %@: %@", dir, myError);
+            continue;
+        }
+        for (NSString *name in itemsByName) {
+            NSString *itemPath = [dir stringByAppendingPathComponent:name];
+            if ([planItems objectForKey:itemPath] != nil) {
+                [targetItemsByObjectPath setObject:[itemsByName objectForKey:name] forKey:itemPath];
+            }
+        }
+    }
+
+    NSMutableArray *archivedPaths = [NSMutableArray array];
+    unsigned long long archivedBytes = 0;
+    NSUInteger missing = 0;
+    NSMutableDictionary *objectCountsByStorageClass = [NSMutableDictionary dictionary];
+    for (NSString *objectPath in planItems) {
+        Item *item = [targetItemsByObjectPath objectForKey:objectPath];
+        if (item == nil) {
+            missing++;
+            if (missing <= 5) {
+                fprintf(stderr, "warning: referenced object not found in target: %s\n", [objectPath UTF8String]);
+            }
+            continue;
+        }
+        NSString *storageClass = [item storageClass] != nil ? [item storageClass] : @"STANDARD";
+        NSNumber *count = [objectCountsByStorageClass objectForKey:storageClass];
+        [objectCountsByStorageClass setObject:[NSNumber numberWithUnsignedInteger:[count unsignedIntegerValue] + 1] forKey:storageClass];
+        if ([storageClass isEqualToString:@"GLACIER"] || [storageClass isEqualToString:@"DEEP_ARCHIVE"]) {
+            [archivedPaths addObject:objectPath];
+            archivedBytes += [item fileSize];
+        }
+    }
+    for (NSString *storageClass in objectCountsByStorageClass) {
+        printf("  %s: %lu objects\n", [storageClass UTF8String], (unsigned long)[[objectCountsByStorageClass objectForKey:storageClass] unsignedIntegerValue]);
+    }
+    if (missing > 0) {
+        fprintf(stderr, "warning: %lu referenced objects were not found in the target\n", (unsigned long)missing);
+    }
+    if ([archivedPaths count] == 0) {
+        printf("no objects require thawing\n");
+        return YES;
+    }
+    printf("%lu archived objects (%s) require thawing\n",
+           (unsigned long)[archivedPaths count], [[ByteSize descriptionForSize:archivedBytes] UTF8String]);
+
+    if (statusOnly) {
+        // Sample restore status. Note: an archived object that has never had a restore
+        // requested reports as restored here (no x-amz-restore header), so -status is
+        // only meaningful after a request sweep has been issued.
+        NSUInteger sampleStride = [archivedPaths count] / THAW_STATUS_SAMPLE_SIZE;
+        if (sampleStride == 0) {
+            sampleStride = 1;
+        }
+        NSUInteger checked = 0;
+        NSUInteger restored = 0;
+        for (NSUInteger i = 0; i < [archivedPaths count]; i += sampleStride) {
+            NSError *myError = nil;
+            NSNumber *isRestored = [conn isObjectRestoredAtPath:[archivedPaths objectAtIndex:i] delegate:nil error:&myError];
+            if (isRestored == nil) {
+                HSLogWarn(@"restore status check failed for %@: %@", [archivedPaths objectAtIndex:i], myError);
+                continue;
+            }
+            checked++;
+            if ([isRestored boolValue]) {
+                restored++;
+            }
+        }
+        if (checked == 0) {
+            SETNSERROR([self errorDomain], -1, @"unable to check restore status of any sampled object");
+            return NO;
+        }
+        printf("sampled %lu of %lu archived objects: %lu restored (%.0f%%)\n",
+               (unsigned long)checked, (unsigned long)[archivedPaths count], (unsigned long)restored,
+               100.0 * (double)restored / (double)checked);
+        return YES;
+    }
+
+    NSString *tierName = glacierRetrievalTier == GLACIER_RETRIEVAL_TIER_BULK ? @"bulk"
+                       : (glacierRetrievalTier == GLACIER_RETRIEVAL_TIER_STANDARD ? @"standard" : @"expedited");
+    printf("requesting %s-tier restore of %lu objects for %lu days\n",
+           [tierName UTF8String], (unsigned long)[archivedPaths count], (unsigned long)glacierRestoreDays);
+
+    unsigned long long requestedCount = 0;
+    unsigned long long alreadyInProgressCount = 0;
+    unsigned long long failedCount = 0;
+    [Arq7ThawRequester requestRestoreOfObjectPaths:archivedPaths
+                                  targetConnection:conn
+                                              days:glacierRestoreDays
+                                              tier:glacierRetrievalTier
+                                         requested:&requestedCount
+                                 alreadyInProgress:&alreadyInProgressCount
+                                            failed:&failedCount];
+
+    printf("\nrequested or extended: %llu\nalready restoring: %llu\nfailed: %llu\n",
+           requestedCount, alreadyInProgressCount, failedCount);
+    printf("\nbulk restores from Deep Archive complete within 48 hours.\n");
+    printf("check readiness with the -status flag; re-run this thaw command daily to extend\n");
+    printf("the restore window of objects you still need (extensions are billed as GET requests).\n");
+    if (failedCount > 0) {
+        SETNSERROR([self errorDomain], -1, @"%llu restore requests failed; re-run thaw to retry", failedCount);
+        return NO;
+    }
+    return YES;
+}
+
 - (BOOL)restore:(NSArray *)args error:(NSError **)error {
+    int glacierRetrievalTier = GLACIER_RETRIEVAL_TIER_BULK;
+    NSUInteger glacierRestoreDays = DEFAULT_GLACIER_RESTORE_DAYS;
+    NSUInteger pollMinutes = DEFAULT_THAW_POLL_MINUTES;
+    NSString *backupRecordId = nil;
+    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:&pollMinutes recordId:&backupRecordId replan:NULL statusOnly:NULL error:error];
+    if (args == nil) {
+        return NO;
+    }
     if ([args count] != 5 && [args count] != 6) {
         SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid arguments");
         return NO;
@@ -786,21 +1242,8 @@
         }
 
         Arq7KeySet *keySet = nil;
-        if ([bs isEncrypted]) {
-            NSString *theEncryptionPassword = [self readPasswordWithPrompt:@"enter encryption password:" error:error];
-            if (theEncryptionPassword == nil) {
-                return NO;
-            }
-            printf("\n");
-            NSString *keysetPath = [NSString stringWithFormat:@"%@/%@/encryptedkeyset.dat", [conn pathPrefix], theUUID];
-            NSData *keysetData = [conn contentsOfFileAtPath:keysetPath delegate:nil error:error];
-            if (keysetData == nil) {
-                return NO;
-            }
-            keySet = [[Arq7KeySet alloc] initWithEncryptedData:keysetData encryptionPassword:theEncryptionPassword error:error];
-            if (keySet == nil) {
-                return NO;
-            }
+        if (![self loadArq7KeySet:&keySet forBackupSet:bs targetConnection:conn planUUID:theUUID error:error]) {
+            return NO;
         }
 
         // Arq7 restore path: try backupfolders first.
@@ -809,9 +1252,15 @@
         if (hasFolderDir != nil && [hasFolderDir boolValue]) {
             NSString *restoreName = theRelativePath ? [theRelativePath lastPathComponent] : theFolderUUID;
             NSString *destinationPath = [[[NSFileManager defaultManager] currentDirectoryPath] stringByAppendingPathComponent:restoreName];
-            if ([[NSFileManager defaultManager] fileExistsAtPath:destinationPath]) {
-                SETNSERROR([self errorDomain], -1, @"%@ already exists", destinationPath);
-                return NO;
+            BOOL isDirectory = NO;
+            if ([[NSFileManager defaultManager] fileExistsAtPath:destinationPath isDirectory:&isDirectory]) {
+                // Allow resuming a multi-day (thaw-waiting) restore into an existing directory;
+                // files already present with the expected size are skipped.
+                if (!isDirectory) {
+                    SETNSERROR([self errorDomain], -1, @"%@ already exists", destinationPath);
+                    return NO;
+                }
+                printf("destination exists; resuming restore into it\n");
             }
 
             printf("target   %s\n", [[target endpointDisplayName] UTF8String]);
@@ -825,6 +1274,10 @@
                                                                      keySet:keySet
                                                                relativePath:theRelativePath
                                                             destinationPath:destinationPath
+                                                             backupRecordId:backupRecordId
+                                                       glacierRetrievalTier:glacierRetrievalTier
+                                                         glacierRestoreDays:glacierRestoreDays
+                                                                pollMinutes:pollMinutes
                                                                    delegate:nil];
             return [restorer restore:error];
         }
@@ -961,7 +1414,7 @@
         GlacierRestorerParamSet *paramSet = [[GlacierRestorerParamSet alloc] initWithBucket:matchingBucket
                                                                           encryptionPassword:theEncryptionPassword
                                                                       downloadBytesPerSecond:bytesPerSecond
-                                                                        glacierRetrievalTier:GLACIER_RETRIEVAL_TIER_EXPEDITED
+                                                                        glacierRetrievalTier:glacierRetrievalTier
                                                                                commitBlobKey:commitBlobKey
                                                                                 rootItemName:[[matchingBucket localPath] lastPathComponent]
                                                                                  treeVersion:CURRENT_TREE_VERSION
@@ -978,7 +1431,7 @@
         S3GlacierRestorerParamSet *paramSet = [[S3GlacierRestorerParamSet alloc] initWithBucket:matchingBucket
                                                                               encryptionPassword:theEncryptionPassword
                                                                           downloadBytesPerSecond:bytesPerSecond
-                                                                            glacierRetrievalTier:GLACIER_RETRIEVAL_TIER_EXPEDITED
+                                                                            glacierRetrievalTier:glacierRetrievalTier
                                                                                    commitBlobKey:commitBlobKey
                                                                                     rootItemName:[[matchingBucket localPath] lastPathComponent]
                                                                                      treeVersion:CURRENT_TREE_VERSION
