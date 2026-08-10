@@ -781,7 +781,10 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
             continue;
         }
         if ([childNode isTree]) {
-            printf("%s/%s/\n", [labelPath UTF8String], [childName UTF8String]);
+            printf("%s/%s/ (%s, %llu file%s)\n", [labelPath UTF8String], [childName UTF8String],
+                   [[ByteSize descriptionForSize:[childNode itemSize]] UTF8String],
+                   [childNode containedFilesCount],
+                   [childNode containedFilesCount] == 1 ? "" : "s");
         } else {
             unsigned long long size = [childNode isSparse] ? [childNode sparseLogicalSize] : [childNode itemSize];
             printf("%s/%s (%s)\n", [labelPath UTF8String], [childName UTF8String], [[ByteSize descriptionForSize:size] UTF8String]);
