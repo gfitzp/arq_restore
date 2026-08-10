@@ -747,6 +747,11 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
         if ([path hasPrefix:@"/"]) {
             path = [path substringFromIndex:1];
         }
+        while ([path hasSuffix:@"/"]) {
+            // A trailing slash (e.g. from shell tab completion) would otherwise
+            // become a literal "/" path component.
+            path = [path substringToIndex:[path length] - 1];
+        }
         NSArray *components = [path pathComponents];
         for (NSUInteger i = 0; i < [components count]; i++) {
             NSString *component = [components objectAtIndex:i];
@@ -1524,6 +1529,9 @@ static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encry
         NSString *path = [args objectAtIndex:5];
         if ([path hasPrefix:@"/"]) {
             path = [path substringFromIndex:1];
+        }
+        while ([path hasSuffix:@"/"]) {
+            path = [path substringToIndex:[path length] - 1];
         }
         NSArray *pathComponents = [path pathComponents];
         for (NSUInteger index = 0; index < [pathComponents count]; index++) {

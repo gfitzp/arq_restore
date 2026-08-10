@@ -137,6 +137,11 @@
         if ([path hasPrefix:@"/"]) {
             path = [path substringFromIndex:1];
         }
+        while ([path hasSuffix:@"/"]) {
+            // A trailing slash (e.g. from shell tab completion) would otherwise
+            // become a literal "/" path component.
+            path = [path substringToIndex:[path length] - 1];
+        }
         NSArray *components = [path pathComponents];
         Arq7Tree *currentTree = rootTree;
         for (NSUInteger i = 0; i < [components count]; i++) {
