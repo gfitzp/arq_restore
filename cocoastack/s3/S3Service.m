@@ -382,6 +382,7 @@ NSString *kS3StorageClassReducedRedundancy = @"REDUCED_REDUNDANCY";
     switch (theGlacierRetrievalTier) {
         case GLACIER_RETRIEVAL_TIER_BULK:
             glacierRetrievalTierText = @"Bulk";
+            break;
         case GLACIER_RETRIEVAL_TIER_STANDARD:
             glacierRetrievalTierText = @"Standard";
             break;

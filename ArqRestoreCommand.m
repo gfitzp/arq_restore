@@ -527,7 +527,7 @@
 
     NSArray *buckets = [Bucket bucketsWithTarget:target computerUUID:theUUID encryptionPassword:theEncryptionPassword targetConnectionDelegate:nil error:error];
     if (buckets == nil) {
-        return nil;
+        return NO;
     }
     Bucket *matchingBucket = nil;
     for (Bucket *bucket in buckets) {

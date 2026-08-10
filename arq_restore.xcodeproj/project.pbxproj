@@ -115,7 +115,7 @@
 		F8A18C961E3E14CA00AF9F97 /* StandardRestoreWorker.m in Sources */ = {isa = PBXBuildFile; fileRef = F8A18C951E3E14CA00AF9F97 /* StandardRestoreWorker.m */; };
 		F8A18C991E3E14DD00AF9F97 /* StandardRestoreItem.m in Sources */ = {isa = PBXBuildFile; fileRef = F8A18C981E3E14DD00AF9F97 /* StandardRestoreItem.m */; };
 		F8A18C9A1E3E165F00AF9F97 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = F805B8C51160EC4E007EC01E /* Cocoa.framework */; };
-		F8A18C9E1E3E16A400AF9F97 /* sqlite3.c in Sources */ = {isa = PBXBuildFile; fileRef = F8A18C9C1E3E16A400AF9F97 /* sqlite3.c */; };
+		F8A18C9E1E3E16A400AF9F97 /* sqlite3.c in Sources */ = {isa = PBXBuildFile; fileRef = F8A18C9C1E3E16A400AF9F97 /* sqlite3.c */; settings = {COMPILER_FLAGS = "-Wno-implicit-fallthrough"; }; };
 		F8A18CA11E3E16C400AF9F97 /* libz.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = F8A18CA01E3E16C400AF9F97 /* libz.tbd */; };
 		F8A18CA61E3E170F00AF9F97 /* S3SignatureV1AuthorizationProvider.m in Sources */ = {isa = PBXBuildFile; fileRef = F8A18CA31E3E170F00AF9F97 /* S3SignatureV1AuthorizationProvider.m */; };
 		F8A18CA71E3E170F00AF9F97 /* S3SignatureV4AuthorizationProvider.m in Sources */ = {isa = PBXBuildFile; fileRef = F8A18CA51E3E170F00AF9F97 /* S3SignatureV4AuthorizationProvider.m */; };
@@ -2148,7 +2148,10 @@
 				);
 				PRODUCT_NAME = arq_restore;
 				SDKROOT = macosx;
-				WARNING_CFLAGS = "-Wno-objc-designated-initializers";
+				WARNING_CFLAGS = (
+					"-Wno-objc-designated-initializers",
+					"-Wimplicit-fallthrough",
+				);
 			};
 			name = Debug;
 		};
@@ -2178,7 +2181,10 @@
 				);
 				PRODUCT_NAME = arq_restore;
 				SDKROOT = macosx;
-				WARNING_CFLAGS = "-Wno-objc-designated-initializers";
+				WARNING_CFLAGS = (
+					"-Wno-objc-designated-initializers",
+					"-Wimplicit-fallthrough",
+				);
 			};
 			name = Release;
 		};
