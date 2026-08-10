@@ -77,8 +77,12 @@
     
     NSMutableDictionary *ret = [NSMutableDictionary dictionary];
 	while (isTruncated) {
-        NSArray *items = [self nextPage:error];
+        NSError *pageError = nil;
+        NSArray *items = [self nextPage:&pageError];
         if (items == nil) {
+            if (error != NULL) {
+                *error = pageError;
+            }
             ret = nil;
             break;
         }
@@ -122,10 +126,13 @@
         return nil;
     }
     NSArray *foundPrefixes = nil;
-    NSArray *listBucketResultContents = [self parseXMLResponse:response foundPrefixes:&foundPrefixes error:&myError];
+    // Keep the XML document alive until the end of this method: the Contents nodes
+    // below are only valid while their document exists.
+    NS_VALID_UNTIL_END_OF_SCOPE NSXMLDocument *xmlDoc = nil;
+    NSArray *listBucketResultContents = [self parseXMLResponse:response document:&xmlDoc foundPrefixes:&foundPrefixes error:&myError];
     if (listBucketResultContents == nil && myError == nil) {
         [NSThread sleepForTimeInterval:0.2];
-        listBucketResultContents = [self parseXMLResponse:response foundPrefixes:&foundPrefixes error:&myError];
+        listBucketResultContents = [self parseXMLResponse:response document:&xmlDoc foundPrefixes:&foundPrefixes error:&myError];
     }
     if (listBucketResultContents == nil) {
         if (myError == nil) {
@@ -139,20 +146,21 @@
     
     NSString *lastObjectPath = nil;
     NSMutableArray *ret = [NSMutableArray array];
-    
+
     for (NSString *foundPrefix in foundPrefixes) {
         Item *item = [[Item alloc] init];
         item.isDirectory = YES;
         item.name = [foundPrefix lastPathComponent];
         [ret addObject:item];
     }
-    
+
     for (NSXMLNode *objectNode in listBucketResultContents) {
         Item *item = [[Item alloc] init];
         item.isDirectory = NO;
-        
+
         NSXMLNode *keyNode = [[objectNode nodesForXPath:@"Key" error:error] lastObject];
         if (keyNode == nil) {
+            SETNSERROR([S3Service errorDomain], -1, @"no Key element in ListBucketResult Contents node: %@", [objectNode XMLString]);
             return nil;
         }
         NSString *objectPath = [NSString stringWithFormat:@"/%@/%@", s3BucketName, [keyNode stringValue]];
@@ -161,6 +169,7 @@
         
         NSXMLNode *lastModifiedNode = [[objectNode nodesForXPath:@"LastModified" error:error] lastObject];
         if (lastModifiedNode == nil) {
+            SETNSERROR([S3Service errorDomain], -1, @"no LastModified element in ListBucketResult Contents node: %@", [objectNode XMLString]);
             return nil;
         }
         NSDate *lastModified = [RFC822 dateFromString:[lastModifiedNode stringValue] error:error];
@@ -204,9 +213,16 @@
     return ret;
 }
 
-- (NSArray *)parseXMLResponse:(NSData *)response foundPrefixes:(NSArray **)foundPrefixes error:(NSError **)error {
+// outDocument receives the parsed document. The caller MUST keep a strong reference to
+// it for as long as it uses the returned NSXMLNodes: under ARC the document would
+// otherwise be deallocated when this method returns, orphaning the nodes so that
+// relative XPath queries on them silently return no matches.
+- (NSArray *)parseXMLResponse:(NSData *)response document:(NSXMLDocument **)outDocument foundPrefixes:(NSArray **)foundPrefixes error:(NSError **)error {
     NSError *myError = nil;
     NSXMLDocument *xmlDoc = [[NSXMLDocument alloc] initWithData:response options:0 error:&myError];
+    if (outDocument != NULL) {
+        *outDocument = xmlDoc;
+    }
     if (!xmlDoc) {
         HSLogDebug(@"list Objects XML data: %@", [[NSString alloc] initWithData:response encoding:NSUTF8StringEncoding]);
         SETNSERROR([S3Service errorDomain], [myError code], @"error parsing List Objects XML response: %@", myError);

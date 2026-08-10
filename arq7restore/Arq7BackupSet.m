@@ -1,4 +1,5 @@
 #import "Arq7BackupSet.h"
+#import "S3Service.h"
 #import "Target.h"
 #import "TargetConnection.h"
 
@@ -39,8 +40,12 @@
         Arq7BackupSet *bs = [Arq7BackupSet backupSetWithPlanUUID:uuid targetConnection:conn delegate:theDelegate error:&myError];
         if (bs != nil) {
             [ret addObject:bs];
+        } else if (![myError isErrorWithDomain:@"Arq7BackupSetErrorDomain" code:ERROR_NOT_FOUND]) {
+            // Not-found just means it's not an Arq7 backup set (e.g. an Arq5 computerUUID);
+            // anything else (auth, network, parse) is worth surfacing rather than skipping silently.
+            fprintf(stderr, "warning: error reading %s as an Arq 6/7 backup set: %s\n",
+                    [uuid UTF8String], [[myError localizedDescription] UTF8String]);
         }
-        // If nil, it's not an Arq7 backup set (e.g., it's an Arq5 computerUUID) — skip silently.
     }
     return ret;
 }
@@ -52,8 +57,15 @@
     NSString *configPath = [NSString stringWithFormat:@"%@/%@/backupconfig.json", [theConn pathPrefix], thePlanUUID];
     NSError *myError = nil;
     NSNumber *exists = [theConn fileExistsAtPath:configPath dataSize:NULL delegate:theDelegate error:&myError];
-    if (exists == nil || ![exists boolValue]) {
+    if (exists == nil) {
+        if (error != NULL) {
+            *error = myError;
+        }
+        return nil;
+    }
+    if (![exists boolValue]) {
         // Not an Arq7 backup set.
+        SETNSERROR(@"Arq7BackupSetErrorDomain", ERROR_NOT_FOUND, @"no backupconfig.json for %@", thePlanUUID);
         return nil;
     }
 

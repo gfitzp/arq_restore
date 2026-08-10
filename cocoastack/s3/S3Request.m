@@ -181,6 +181,7 @@
 - (NSData *)dataOnce:(NSError **)error {
     id <HTTPConnection> conn = [[HTTPConnectionFactory theFactory] newHTTPConnectionToURL:url method:method dataTransferDelegate:dataTransferDelegate];
     if (conn == nil) {
+        SETNSERROR([S3Service errorDomain], -1, @"unable to create HTTP connection to %@", url);
         return nil;
     }
     [conn setRequestHostHeader];
@@ -211,11 +212,11 @@
     if (![sap setAuthorizationOnHTTPConnection:conn contentSHA256:contentSHA256 now:now stringToSign:&stringToSign canonicalRequest:&canonicalRequest error:error]) {
         return nil;
     }
-    
+
     bytesUploaded = 0;
-    
+
 //    HSLogDebug(@"%@ %@", method, url);
-    
+
     NSData *response = [conn executeRequestWithBody:requestBody error:error];
     if (response == nil) {
         return nil;

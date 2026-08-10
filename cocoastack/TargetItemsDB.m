@@ -88,7 +88,8 @@
     __block Item *ret = nil;
     __block NSError *blockError = nil;
     if (![ff lockAndExecute:^void() { ret = [self lockedItemAtPath:thePath error:&blockError]; } error:error]) {
-        ret = nil;
+        // Keep the flock error from lockAndExecute; blockError is nil because the block never ran.
+        return nil;
     }
     if (error != NULL) *error = blockError;
     return ret;
