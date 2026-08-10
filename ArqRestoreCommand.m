@@ -158,15 +158,19 @@
     NSString *oAuth2RedirectURI = nil;
     
     if ([targetType isEqualToString:@"aws"]) {
-        if ([args count] != 5) {
+        if ([args count] != 5 && [args count] != 6) {
             SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid arguments");
             return NO;
         }
-        
+
         NSString *accessKeyId = [args objectAtIndex:4];
+        // The Arq5 code paths resolve "any_bucket" by scanning all buckets in the
+        // account, but the Arq6/Arq7 paths use the endpoint's bucket directly, so
+        // for those an explicit bucket name is required.
+        NSString *bucketName = [args count] == 6 ? [args objectAtIndex:5] : @"any_bucket";
         AWSRegion *usEast1 = [AWSRegion usEast1];
-        NSString *urlString = [NSString stringWithFormat:@"https://%@@%@/any_bucket", accessKeyId, [[usEast1 s3EndpointWithSSL:NO] host]];
-        
+        NSString *urlString = [NSString stringWithFormat:@"https://%@@%@/%@", accessKeyId, [[usEast1 s3EndpointWithSSL:NO] host], bucketName];
+
         endpoint = [NSURL URLWithString:urlString];
         secret = [self readPasswordWithPrompt:@"enter AWS secret key:" error:error];
         if (secret == nil) {
@@ -283,6 +287,8 @@
             // Arq6/7 entries.
             if (arq7BackupSets == nil) {
                 HSLogError(@"error getting Arq7/Arq6 backup sets for %@: %@", theTarget, arq7Error);
+                fprintf(stderr, "warning: unable to check for Arq 6/7 backup sets: %s\n",
+                        [[arq7Error localizedDescription] UTF8String]);
             } else {
                 for (Arq7BackupSet *bs in arq7BackupSets) {
                     BOOL isArq6 = (listConn != nil) && [Arq6Snapshot isArq6PlanUUID:[bs planUUID]
@@ -567,7 +573,7 @@
     if (args == nil) {
         return NO;
     }
-    if ([args count] != 5) {
+    if ([args count] != 5 && [args count] != 6) {
         SETNSERROR([self errorDomain], ERROR_USAGE, @"invalid arguments");
         return NO;
     }
@@ -579,6 +585,7 @@
 
     NSString *theUUID = [args objectAtIndex:3];
     NSString *theFolderUUID = [args objectAtIndex:4];
+    NSString *theRelativePath = ([args count] == 6) ? [args objectAtIndex:5] : nil;
 
     // Detect Arq7.
     TargetConnection *conn = [target newConnection:error];
@@ -651,7 +658,7 @@
             if (rootTree == nil) {
                 return NO;
             }
-            return [self printArq7Tree:rootTree blobReader:blobReader relativePath:@"" error:error];
+            return [self printArq7TreeStartingAtRelativePath:theRelativePath rootTree:rootTree blobReader:blobReader error:error];
         }
 
         // Arq6 path: theFolderUUID is the diskIdentifier.
@@ -681,7 +688,12 @@
         if (rootTree == nil) {
             return NO;
         }
-        return [self printArq7Tree:rootTree blobReader:blobReader relativePath:@"" error:error];
+        return [self printArq7TreeStartingAtRelativePath:theRelativePath rootTree:rootTree blobReader:blobReader error:error];
+    }
+
+    if (theRelativePath != nil) {
+        SETNSERROR([self errorDomain], -1, @"relative_path is currently supported only for Arq 6 and Arq 7 backup sets");
+        return NO;
     }
 
     // Arq5 path (unchanged).
@@ -736,6 +748,44 @@
     }
     return [self printTree:rootTree repo:repo relativePath:@"" error:error];
 }
+// Walks theRelativePath (nil = root) from rootTree, then prints the subtree
+// (or the single file) found there.
+- (BOOL)printArq7TreeStartingAtRelativePath:(NSString *)theRelativePath rootTree:(Arq7Tree *)rootTree blobReader:(Arq7BlobReader *)theBlobReader error:(NSError **)error {
+    if (theRelativePath == nil) {
+        return [self printArq7Tree:rootTree blobReader:theBlobReader relativePath:@"" error:error];
+    }
+    NSString *path = theRelativePath;
+    if ([path hasPrefix:@"/"]) {
+        path = [path substringFromIndex:1];
+    }
+    NSArray *components = [path pathComponents];
+    Arq7Tree *currentTree = rootTree;
+    NSString *labelPath = @"";
+    for (NSUInteger i = 0; i < [components count]; i++) {
+        NSString *component = [components objectAtIndex:i];
+        labelPath = [labelPath stringByAppendingFormat:@"/%@", component];
+        Arq7Node *childNode = [currentTree childNodeWithName:component];
+        if (childNode == nil) {
+            SETNSERROR([self errorDomain], ERROR_NOT_FOUND, @"path component '%@' not found", component);
+            return NO;
+        }
+        if ([childNode isTree]) {
+            currentTree = [theBlobReader treeForBlobLoc:[childNode treeBlobLoc] error:error];
+            if (currentTree == nil) {
+                return NO;
+            }
+        } else {
+            if (i < [components count] - 1) {
+                SETNSERROR([self errorDomain], -1, @"'%@' is not a directory", component);
+                return NO;
+            }
+            printf("%s\n", [labelPath UTF8String]);
+            return YES;
+        }
+    }
+    return [self printArq7Tree:currentTree blobReader:theBlobReader relativePath:labelPath error:error];
+}
+
 - (BOOL)printArq7Tree:(Arq7Tree *)theTree blobReader:(Arq7BlobReader *)theBlobReader relativePath:(NSString *)theRelativePath error:(NSError **)error {
     for (NSString *childName in [theTree childNodeNames]) {
         NSString *childRelativePath = [theRelativePath stringByAppendingFormat:@"/%@", childName];

@@ -37,14 +37,15 @@
 static void printUsage(const char *exeName) {
 	fprintf(stderr, "Usage:\n");
     fprintf(stderr, "\t%s [-l loglevel] listtargets\n", exeName);
-    fprintf(stderr, "\t%s [-l loglevel] addtarget <nickname> aws <access_key>\n", exeName);
+    fprintf(stderr, "\t%s [-l loglevel] addtarget <nickname> aws <access_key> [bucket_name]\n", exeName);
+    fprintf(stderr, "\t\t(bucket_name is required for Arq 6 and Arq 7 backup sets)\n");
     fprintf(stderr, "\t%s [-l loglevel] addtarget <nickname> local <path>\n", exeName);
     fprintf(stderr, "\t%s [-l loglevel] deletetarget <nickname>\n", exeName);
     fprintf(stderr, "\n");
     fprintf(stderr, "\t%s [-l loglevel] listcomputers <target_nickname>\n", exeName);
     fprintf(stderr, "\t%s [-l loglevel] listfolders <target_nickname> <computer_uuid>\n", exeName);
     fprintf(stderr, "\t%s [-l loglevel] printplist <target_nickname> <computer_uuid> <folder_uuid>\n", exeName);
-    fprintf(stderr, "\t%s [-l loglevel] listtree [-record id] <target_nickname> <computer_uuid> <folder_uuid>\n", exeName);
+    fprintf(stderr, "\t%s [-l loglevel] listtree [-record id] <target_nickname> <computer_uuid> <folder_uuid> [relative_path]\n", exeName);
     fprintf(stderr, "\t%s [-l loglevel] listbackups <target_nickname> <computer_uuid> <folder_uuid>\n", exeName);
     fprintf(stderr, "\t%s [-l loglevel] restore [-record id] [-tier bulk|standard|expedited] [-days n] [-poll n] <target_nickname> <computer_uuid> <folder_uuid> [relative_path]\n", exeName);
     fprintf(stderr, "\t%s [-l loglevel] thaw [-record id] [-tier bulk|standard|expedited] [-days n] [-status] [-replan] <target_nickname> <computer_uuid> <folder_uuid> [relative_path]\n", exeName);
