@@ -73,6 +73,11 @@
 #import "ByteSize.h"
 #import "UserLibrary_Arq.h"
 #import "TargetConnection.h"
+#import "KeychainFactory.h"
+#import "KeychainItem.h"
+#import "Keychain.h"
+
+static NSString *ENCRYPTION_PASSWORD_KEYCHAIN_LABEL = @"arq_restore backup encryption password";
 
 #define BUFSIZE (65536)
 #define DEFAULT_GLACIER_RESTORE_DAYS (2)
@@ -149,6 +154,10 @@
     NSString *targetUUID = [NSString stringWithRandomUUID];
     NSString *targetNickname = [args objectAtIndex:2];
     NSString *targetType = [args objectAtIndex:3];
+    if ([[TargetFactory sharedTargetFactory] targetWithNickname:targetNickname] != nil) {
+        SETNSERROR([self errorDomain], -1, @"a target named '%@' already exists; delete it first with: deletetarget %@", targetNickname, targetNickname);
+        return NO;
+    }
     
     NSURL *endpoint = nil;
     NSString *secret = nil;
@@ -222,12 +231,13 @@
         SETNSERROR([self errorDomain], ERROR_NOT_FOUND, @"target not found");
         return NO;
     }
-    TargetConnection *conn = [target newConnection:error];
-    if (conn == nil) {
-        return NO;
-    }
-    if (![conn clearAllCachedData:error]) {
-        return NO;
+    // Clearing the cache is best-effort: it needs the target's keychain secret,
+    // and a target with a missing/broken secret must still be deletable.
+    NSError *myError = nil;
+    TargetConnection *conn = [target newConnection:&myError];
+    if (conn == nil || ![conn clearAllCachedData:&myError]) {
+        fprintf(stderr, "warning: unable to clear cached data for %s: %s\n",
+                [[target nickname] UTF8String], [[myError localizedDescription] UTF8String]);
     }
 
     return [[TargetFactory sharedTargetFactory] deleteTarget:target error:error];
@@ -337,21 +347,8 @@
         }
 
         Arq7KeySet *keySet = nil;
-        if ([bs isEncrypted]) {
-            NSString *theEncryptionPassword = [self readPasswordWithPrompt:@"enter encryption password:" error:error];
-            if (theEncryptionPassword == nil) {
-                return NO;
-            }
-            printf("\n");
-            NSString *keysetPath = [NSString stringWithFormat:@"%@/%@/encryptedkeyset.dat", [conn pathPrefix], theUUID];
-            NSData *keysetData = [conn contentsOfFileAtPath:keysetPath delegate:nil error:error];
-            if (keysetData == nil) {
-                return NO;
-            }
-            keySet = [[Arq7KeySet alloc] initWithEncryptedData:keysetData encryptionPassword:theEncryptionPassword error:error];
-            if (keySet == nil) {
-                return NO;
-            }
+        if (![self loadArq7KeySet:&keySet forBackupSet:bs targetConnection:conn planUUID:theUUID error:error]) {
+            return NO;
         }
 
         // Arq7 path: try backupfolders first.
@@ -445,21 +442,8 @@
         }
 
         Arq7KeySet *keySet = nil;
-        if ([bs isEncrypted]) {
-            NSString *theEncryptionPassword = [self readPasswordWithPrompt:@"enter encryption password:" error:error];
-            if (theEncryptionPassword == nil) {
-                return NO;
-            }
-            printf("\n");
-            NSString *keysetPath = [NSString stringWithFormat:@"%@/%@/encryptedkeyset.dat", [conn pathPrefix], theUUID];
-            NSData *keysetData = [conn contentsOfFileAtPath:keysetPath delegate:nil error:error];
-            if (keysetData == nil) {
-                return NO;
-            }
-            keySet = [[Arq7KeySet alloc] initWithEncryptedData:keysetData encryptionPassword:theEncryptionPassword error:error];
-            if (keySet == nil) {
-                return NO;
-            }
+        if (![self loadArq7KeySet:&keySet forBackupSet:bs targetConnection:conn planUUID:theUUID error:error]) {
+            return NO;
         }
 
         // Arq7 path: try backupfolders first.
@@ -569,7 +553,8 @@
 }
 - (BOOL)listTree:(NSArray *)args error:(NSError **)error {
     NSString *backupRecordId = nil;
-    args = [self argsByStrippingGlacierOptions:args tier:NULL days:NULL pollMinutes:NULL recordId:&backupRecordId replan:NULL statusOnly:NULL error:error];
+    BOOL recursive = NO;
+    args = [self argsByStrippingGlacierOptions:args tier:NULL days:NULL pollMinutes:NULL recordId:&backupRecordId recursive:&recursive replan:NULL statusOnly:NULL error:error];
     if (args == nil) {
         return NO;
     }
@@ -658,7 +643,7 @@
             if (rootTree == nil) {
                 return NO;
             }
-            return [self printArq7TreeStartingAtRelativePath:theRelativePath rootTree:rootTree blobReader:blobReader error:error];
+            return [self printArq7TreeStartingAtRelativePath:theRelativePath rootTree:rootTree blobReader:blobReader recursive:recursive error:error];
         }
 
         // Arq6 path: theFolderUUID is the diskIdentifier.
@@ -688,7 +673,7 @@
         if (rootTree == nil) {
             return NO;
         }
-        return [self printArq7TreeStartingAtRelativePath:theRelativePath rootTree:rootTree blobReader:blobReader error:error];
+        return [self printArq7TreeStartingAtRelativePath:theRelativePath rootTree:rootTree blobReader:blobReader recursive:recursive error:error];
     }
 
     if (theRelativePath != nil) {
@@ -748,48 +733,67 @@
     }
     return [self printTree:rootTree repo:repo relativePath:@"" error:error];
 }
-// Walks theRelativePath (nil = root) from rootTree, then prints the subtree
-// (or the single file) found there.
-- (BOOL)printArq7TreeStartingAtRelativePath:(NSString *)theRelativePath rootTree:(Arq7Tree *)rootTree blobReader:(Arq7BlobReader *)theBlobReader error:(NSError **)error {
-    if (theRelativePath == nil) {
-        return [self printArq7Tree:rootTree blobReader:theBlobReader relativePath:@"" error:error];
-    }
-    NSString *path = theRelativePath;
-    if ([path hasPrefix:@"/"]) {
-        path = [path substringFromIndex:1];
-    }
-    NSArray *components = [path pathComponents];
+// Walks theRelativePath (nil = root) from rootTree, then prints the folder found
+// there — one level by default, the whole subtree when recursive is YES — or the
+// single file if the path names one.
+- (BOOL)printArq7TreeStartingAtRelativePath:(NSString *)theRelativePath rootTree:(Arq7Tree *)rootTree blobReader:(Arq7BlobReader *)theBlobReader recursive:(BOOL)theRecursive error:(NSError **)error {
     Arq7Tree *currentTree = rootTree;
     NSString *labelPath = @"";
-    for (NSUInteger i = 0; i < [components count]; i++) {
-        NSString *component = [components objectAtIndex:i];
-        labelPath = [labelPath stringByAppendingFormat:@"/%@", component];
-        Arq7Node *childNode = [currentTree childNodeWithName:component];
-        if (childNode == nil) {
-            SETNSERROR([self errorDomain], ERROR_NOT_FOUND, @"path component '%@' not found", component);
-            return NO;
+    if (theRelativePath != nil) {
+        NSString *path = theRelativePath;
+        if ([path hasPrefix:@"/"]) {
+            path = [path substringFromIndex:1];
         }
-        if ([childNode isTree]) {
-            currentTree = [theBlobReader treeForBlobLoc:[childNode treeBlobLoc] error:error];
-            if (currentTree == nil) {
+        NSArray *components = [path pathComponents];
+        for (NSUInteger i = 0; i < [components count]; i++) {
+            NSString *component = [components objectAtIndex:i];
+            labelPath = [labelPath stringByAppendingFormat:@"/%@", component];
+            Arq7Node *childNode = [currentTree childNodeWithName:component];
+            if (childNode == nil) {
+                SETNSERROR([self errorDomain], ERROR_NOT_FOUND, @"path component '%@' not found", component);
                 return NO;
             }
-        } else {
-            if (i < [components count] - 1) {
-                SETNSERROR([self errorDomain], -1, @"'%@' is not a directory", component);
-                return NO;
+            if ([childNode isTree]) {
+                currentTree = [theBlobReader treeForBlobLoc:[childNode treeBlobLoc] error:error];
+                if (currentTree == nil) {
+                    return NO;
+                }
+            } else {
+                if (i < [components count] - 1) {
+                    SETNSERROR([self errorDomain], -1, @"'%@' is not a directory", component);
+                    return NO;
+                }
+                unsigned long long size = [childNode isSparse] ? [childNode sparseLogicalSize] : [childNode itemSize];
+                printf("%s (%s)\n", [labelPath UTF8String], [[ByteSize descriptionForSize:size] UTF8String]);
+                return YES;
             }
-            printf("%s\n", [labelPath UTF8String]);
-            return YES;
         }
     }
-    return [self printArq7Tree:currentTree blobReader:theBlobReader relativePath:labelPath error:error];
+    if (theRecursive) {
+        return [self printArq7Tree:currentTree blobReader:theBlobReader relativePath:labelPath error:error];
+    }
+    for (NSString *childName in [[currentTree childNodeNames] sortedArrayUsingSelector:@selector(compare:)]) {
+        Arq7Node *childNode = [currentTree childNodeWithName:childName];
+        if ([childNode deleted]) {
+            continue;
+        }
+        if ([childNode isTree]) {
+            printf("%s/%s/\n", [labelPath UTF8String], [childName UTF8String]);
+        } else {
+            unsigned long long size = [childNode isSparse] ? [childNode sparseLogicalSize] : [childNode itemSize];
+            printf("%s/%s (%s)\n", [labelPath UTF8String], [childName UTF8String], [[ByteSize descriptionForSize:size] UTF8String]);
+        }
+    }
+    return YES;
 }
 
 - (BOOL)printArq7Tree:(Arq7Tree *)theTree blobReader:(Arq7BlobReader *)theBlobReader relativePath:(NSString *)theRelativePath error:(NSError **)error {
-    for (NSString *childName in [theTree childNodeNames]) {
+    for (NSString *childName in [[theTree childNodeNames] sortedArrayUsingSelector:@selector(compare:)]) {
         NSString *childRelativePath = [theRelativePath stringByAppendingFormat:@"/%@", childName];
         Arq7Node *childNode = [theTree childNodeWithName:childName];
+        if ([childNode deleted]) {
+            continue;
+        }
         if ([childNode isTree]) {
             printf("%s:\n", [childRelativePath UTF8String]);
             Arq7Tree *childTree = [theBlobReader treeForBlobLoc:[childNode treeBlobLoc] error:error];
@@ -830,9 +834,9 @@
 }
 
 // Strips -tier <bulk|standard|expedited>, -days <n>, -poll <minutes>, -record <id>,
-// -replan and -status from theArgs, returning the remaining positional arguments.
-// Pass NULL for options a command doesn't accept.
-- (NSArray *)argsByStrippingGlacierOptions:(NSArray *)theArgs tier:(int *)outTier days:(NSUInteger *)outDays pollMinutes:(NSUInteger *)outPollMinutes recordId:(NSString **)outRecordId replan:(BOOL *)outReplan statusOnly:(BOOL *)outStatusOnly error:(NSError **)error {
+// -recursive, -replan and -status from theArgs, returning the remaining positional
+// arguments. Pass NULL for options a command doesn't accept.
+- (NSArray *)argsByStrippingGlacierOptions:(NSArray *)theArgs tier:(int *)outTier days:(NSUInteger *)outDays pollMinutes:(NSUInteger *)outPollMinutes recordId:(NSString **)outRecordId recursive:(BOOL *)outRecursive replan:(BOOL *)outReplan statusOnly:(BOOL *)outStatusOnly error:(NSError **)error {
     NSMutableArray *ret = [NSMutableArray array];
     NSUInteger i = 0;
     while (i < [theArgs count]) {
@@ -894,8 +898,9 @@
                 *outDays = (NSUInteger)days;
             }
             i += 2;
-        } else if ([arg isEqualToString:@"-replan"] || [arg isEqualToString:@"-status"]) {
-            BOOL *flag = [arg isEqualToString:@"-replan"] ? outReplan : outStatusOnly;
+        } else if ([arg isEqualToString:@"-replan"] || [arg isEqualToString:@"-status"] || [arg isEqualToString:@"-recursive"]) {
+            BOOL *flag = [arg isEqualToString:@"-replan"] ? outReplan
+                       : ([arg isEqualToString:@"-status"] ? outStatusOnly : outRecursive);
             if (flag == NULL) {
                 SETNSERROR([self errorDomain], ERROR_USAGE, @"%@ is not valid for this command", arg);
                 return nil;
@@ -910,25 +915,76 @@
     return ret;
 }
 
+- (NSString *)savedEncryptionPasswordForPlanUUID:(NSString *)thePlanUUID {
+    NSError *myError = nil;
+    KeychainItem *item = [[KeychainFactory keychain] existingItemWithLabel:ENCRYPTION_PASSWORD_KEYCHAIN_LABEL account:thePlanUUID error:&myError];
+    if (item == nil) {
+        return nil;
+    }
+    return [[NSString alloc] initWithData:[item passwordData] encoding:NSUTF8StringEncoding];
+}
+
+- (void)saveEncryptionPassword:(NSString *)thePassword forPlanUUID:(NSString *)thePlanUUID {
+    NSError *myError = nil;
+    [[KeychainFactory keychain] destroyItemForLabel:ENCRYPTION_PASSWORD_KEYCHAIN_LABEL account:thePlanUUID error:NULL];
+    if ([[KeychainFactory keychain] createOrUpdateItemWithLabel:ENCRYPTION_PASSWORD_KEYCHAIN_LABEL
+                                                        account:thePlanUUID
+                                                   passwordData:[thePassword dataUsingEncoding:NSUTF8StringEncoding]
+                                                trustedAppPaths:[NSArray arrayWithObject:[ExePath exePath]]
+                                                          error:&myError] == nil) {
+        fprintf(stderr, "warning: unable to save encryption password to keychain: %s\n", [[myError localizedDescription] UTF8String]);
+    } else {
+        printf("encryption password saved to the macOS keychain (label \"%s\")\n", [ENCRYPTION_PASSWORD_KEYCHAIN_LABEL UTF8String]);
+    }
+}
+
+// Resolves the backup set's encryption key set. The password comes from, in order:
+// the ARQ_ENCRYPTION_PASSWORD environment variable (never saved), the macOS
+// keychain (saved from an earlier prompt, keyed by plan UUID so it survives
+// target re-creation), or an interactive prompt. A prompted password is saved
+// to the keychain only after it has successfully decrypted the key set.
 - (BOOL)loadArq7KeySet:(Arq7KeySet **)outKeySet forBackupSet:(Arq7BackupSet *)theBackupSet targetConnection:(TargetConnection *)theConn planUUID:(NSString *)theUUID error:(NSError **)error {
     *outKeySet = nil;
     if (![theBackupSet isEncrypted]) {
         return YES;
     }
-    NSString *theEncryptionPassword = [self readPasswordWithPrompt:@"enter encryption password:" error:error];
-    if (theEncryptionPassword == nil) {
-        return NO;
-    }
-    printf("\n");
     NSString *keysetPath = [NSString stringWithFormat:@"%@/%@/encryptedkeyset.dat", [theConn pathPrefix], theUUID];
     NSData *keysetData = [theConn contentsOfFileAtPath:keysetPath delegate:nil error:error];
     if (keysetData == nil) {
         return NO;
     }
+
+    const char *envPassword = getenv("ARQ_ENCRYPTION_PASSWORD");
+    if (envPassword != NULL) {
+        Arq7KeySet *keySet = [[Arq7KeySet alloc] initWithEncryptedData:keysetData encryptionPassword:[NSString stringWithUTF8String:envPassword] error:error];
+        if (keySet == nil) {
+            return NO;
+        }
+        *outKeySet = keySet;
+        return YES;
+    }
+
+    NSString *savedPassword = [self savedEncryptionPasswordForPlanUUID:theUUID];
+    if (savedPassword != nil) {
+        NSError *myError = nil;
+        Arq7KeySet *keySet = [[Arq7KeySet alloc] initWithEncryptedData:keysetData encryptionPassword:savedPassword error:&myError];
+        if (keySet != nil) {
+            *outKeySet = keySet;
+            return YES;
+        }
+        fprintf(stderr, "saved encryption password no longer decrypts the key set for %s; prompting\n", [theUUID UTF8String]);
+    }
+
+    NSString *theEncryptionPassword = [self readPasswordWithPrompt:@"enter encryption password:" error:error];
+    if (theEncryptionPassword == nil) {
+        return NO;
+    }
+    printf("\n");
     Arq7KeySet *keySet = [[Arq7KeySet alloc] initWithEncryptedData:keysetData encryptionPassword:theEncryptionPassword error:error];
     if (keySet == nil) {
         return NO;
     }
+    [self saveEncryptionPassword:theEncryptionPassword forPlanUUID:theUUID];
     *outKeySet = keySet;
     return YES;
 }
@@ -1085,7 +1141,7 @@
     BOOL replan = NO;
     BOOL statusOnly = NO;
     NSString *backupRecordId = nil;
-    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:NULL recordId:&backupRecordId replan:&replan statusOnly:&statusOnly error:error];
+    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:NULL recordId:&backupRecordId recursive:NULL replan:&replan statusOnly:&statusOnly error:error];
     if (args == nil) {
         return NO;
     }
@@ -1256,7 +1312,7 @@
     NSUInteger glacierRestoreDays = DEFAULT_GLACIER_RESTORE_DAYS;
     NSUInteger pollMinutes = DEFAULT_THAW_POLL_MINUTES;
     NSString *backupRecordId = nil;
-    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:&pollMinutes recordId:&backupRecordId replan:NULL statusOnly:NULL error:error];
+    args = [self argsByStrippingGlacierOptions:args tier:&glacierRetrievalTier days:&glacierRestoreDays pollMinutes:&pollMinutes recordId:&backupRecordId recursive:NULL replan:NULL statusOnly:NULL error:error];
     if (args == nil) {
         return NO;
     }
